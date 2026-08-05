@@ -188,7 +188,9 @@ usage() {
     MCP server is spawned per session by Claude Code. NO_COLOR is honoured.
 
   MORE
-    sn-rag/README.md          install, MCP tools, commands, troubleshooting
+    README.md                 install, MCP tools, commands, troubleshooting
+                              (repo root — moved up from sn-rag/ to be the
+                              GitHub landing page)
     sn-rag/docs/adr/          why things are the way they are
 USAGE
 }

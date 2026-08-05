@@ -299,6 +299,14 @@ def build_children(parent: ParentChunk, blocks: list[Block], target_chars: int, 
         if not buf:
             return
         text = carry + "".join(buf)
+        # A non-empty buf can still be pure whitespace — a blank-line remnant
+        # left between sections. Emitting it produced a chunk whose text was
+        # "\n": a real vector, indexed and searchable, that renders an empty
+        # snippet if it ever ranks. Measured at 2.89% of all children across a
+        # 1500-file sample (432 of 14,930), touching 16.7% of files.
+        if not text.strip():
+            buf, buf_h_path, carry = [], None, ""
+            return
         idx = len(children)
         children.append(ChildChunk(
             chunk_id=make_chunk_id(parent.rel_path, parent.parent_idx, idx),

@@ -169,6 +169,60 @@ def test_children_cover_all_parent_text(name):
             assert by_parent.get(p.parent_id), f"parent {p.parent_idx} produced no children"
 
 
+# --- Property: no chunk is whitespace-only ----------------------------------
+# A blank-line remnant between sections used to flush as its own child whose
+# text was "\n". That is a real vector — indexed, searchable, and rendering an
+# empty snippet if it ever ranks. It surfaced as the top hit for "incident
+# management" and broke test_search_returns_populated_hits. Measured before the
+# fix: 432 of 14,930 children (2.89%) across a 1,500-file sample, 16.7% of files.
+
+@pytest.mark.parametrize("name", ALL_FIXTURES)
+def test_no_whitespace_only_children(name):
+    """Children become vectors, so a blank one is a real defect."""
+    (_, children), _, _ = chunk(name)
+    blank = [c.chunk_id for c in children if not c.text.strip()]
+    assert not blank, f"whitespace-only children: {blank[:5]}"
+
+
+@pytest.mark.parametrize("name", ALL_FIXTURES)
+def test_whitespace_only_parents_are_unreachable(name):
+    """Parents may be blank; they must never be retrievable.
+
+    Parents are deliberately NOT filtered: they must tile the body verbatim
+    (test_parents_reproduce_body_verbatim), so dropping a blank-line remnant
+    would lose the invariant that no source text is silently discarded. That is
+    safe only because a blank parent has no children, and `sn_get_section` is
+    reachable exclusively through a search hit's `parent_id` — i.e. through a
+    child. Measured over 800 corpus files: 44 blank parents, 0 reachable.
+
+    If this ever fails, blank parents became addressable and must be merged into
+    an adjacent parent rather than dropped.
+    """
+    (parents, children), _, _ = chunk(name)
+    referenced = {c.parent_id for c in children}
+    reachable_blanks = [p.parent_id for p in parents
+                        if not p.text.strip() and p.parent_id in referenced]
+    assert not reachable_blanks, f"blank parents are retrievable: {reachable_blanks[:5]}"
+
+
+def test_no_whitespace_only_chunks_in_known_regression_document():
+    """The document that actually produced the '\\n' chunk in production."""
+    rel_path = ("ServiceNowOfficialDocs/operational-technology/"
+                "operational-technology-incident-management/"
+                "operational-technology-incident-management.md")
+    path = CORPUS_PATH / rel_path
+    if not path.exists():
+        pytest.skip(f"fixture not present: {rel_path}")
+    parents, children = chunk_document(
+        path.read_text(encoding="utf-8"), rel_path,
+        PARENT_CHUNK_MIN_CHARS, PARENT_CHUNK_MAX_CHARS,
+        CHILD_CHUNK_CHARS, CHILD_CHUNK_OVERLAP)
+    assert children, "document should still produce children"
+    assert all(c.text.strip() for c in children), (
+        "the blank-chunk regression is back: "
+        f"{[c.chunk_id for c in children if not c.text.strip()]}")
+
+
 @pytest.mark.parametrize("name", ALL_FIXTURES)
 def test_child_ids_unique(name):
     (_, children), _, _ = chunk(name)
@@ -287,3 +341,43 @@ def test_ids_are_deterministic():
                        CHILD_CHUNK_CHARS, CHILD_CHUNK_OVERLAP)
     assert [p.parent_id for p in a[0]] == [p.parent_id for p in b[0]]
     assert [c.chunk_id for c in a[1]] == [c.chunk_id for c in b[1]]
+
+
+# --- embedded-text recipe -------------------------------------------------
+# These guard the signal that was missing until 2026-08-05: the filename and
+# title were never embedded, so a descriptively-named document was unreachable
+# under its own name. Asserting on the assembled STRING, not on counts — the
+# defect this replaces was invisible to every count-based test.
+
+def test_embed_text_includes_title_and_filename_words():
+    from ingest.embed import build_embed_text
+    out = build_embed_text("Body prose here.", h_path="Setup > Auth",
+                           doc_title="Building AI Agents",
+                           rel_path="raw/inbox/servicenow-sdk-guide.md")
+    assert "Building AI Agents" in out
+    # words present in the stem but NOT in the title must survive
+    for word in ("servicenow", "sdk", "guide"):
+        assert word in out, f"filename word {word!r} lost from embedded text"
+    assert "Setup > Auth" in out
+    assert out.endswith("Body prose here.")
+
+
+def test_embed_text_does_not_duplicate_title_words_from_stem():
+    from ingest.embed import build_embed_text
+    out = build_embed_text("Body.", h_path="", doc_title="Building AI Agents",
+                           rel_path="notes/building-ai-agents.md")
+    assert out.lower().count("building") == 1, out
+    assert out.lower().count("agents") == 1, out
+
+
+def test_embed_text_flag_off_reproduces_the_old_recipe():
+    from ingest.embed import build_embed_text
+    out = build_embed_text("Body.", h_path="A > B", doc_title="T",
+                           rel_path="x/y.md", include_title=False)
+    assert out == "A > B\n\nBody."
+
+
+def test_embed_text_survives_missing_title_and_path():
+    from ingest.embed import build_embed_text
+    assert build_embed_text("Body.") == "Body."
+    assert build_embed_text("Body.", h_path="H") == "H\n\nBody."

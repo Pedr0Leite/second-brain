@@ -22,6 +22,53 @@ PAYLOAD_INDEX_FIELDS = (
 )
 
 
+def _default_cache_dir() -> Path:
+    """Model cache location, tolerant of a stale already-imported `config`.
+
+    The MCP server is a long-lived process that imports `config` once at spawn.
+    A plain `from config import MODEL_CACHE_PATH` therefore raises ImportError in
+    any server started before that setting was added — which is exactly what
+    happened: every search returned BACKEND_UNAVAILABLE until the session was
+    restarted. getattr with the documented default degrades to correct behaviour
+    instead of taking the whole tool surface down over a new optional setting.
+    """
+    import config
+    return Path(getattr(config, "MODEL_CACHE_PATH", None)
+                or Path.home() / ".cache" / "fastembed")
+
+
+def _stem_words(rel_path: str) -> str:
+    """Filename stem as words: 'building-ai-agents' -> 'building ai agents'."""
+    stem = Path(rel_path).stem
+    return " ".join(w for w in stem.replace("-", " ").replace("_", " ").split() if w)
+
+
+def build_embed_text(text: str, h_path: str = "", doc_title: str = "",
+                     rel_path: str = "", include_title: bool = True) -> str:
+    """Assemble the string that actually gets embedded.
+
+    Pure and parameterised so the embedding recipe can be tested and A/B'd
+    without touching Qdrant. Order is title, then breadcrumb, then body: the
+    most general locator first, matching how h_path was already prepended.
+
+    The filename stem is appended to the title only when it contributes words
+    the title does not already have. Descriptive filenames in this vault
+    routinely restate the H1 ('building-ai-agents.md' under '# Building AI
+    Agents'), and duplicating them would spend the encoder's limited window
+    repeating one phrase instead of covering the body.
+    """
+    head = ""
+    if include_title:
+        title = (doc_title or "").strip()
+        stem = _stem_words(rel_path) if rel_path else ""
+        have = set(title.lower().split())
+        extra = " ".join(w for w in stem.split() if w.lower() not in have)
+        head = " ".join(p for p in (title, extra) if p).strip()
+    parts = [p for p in (head, (h_path or "").strip()) if p]
+    prefix = "\n".join(parts)
+    return f"{prefix}\n\n{text}" if prefix else text
+
+
 @dataclass(frozen=True)
 class EmbedStats:
     embedded: int = 0
@@ -52,8 +99,7 @@ class Embedder:
         # tempdir default and re-download ~300 MB after each reboot — the exact
         # bug this parameter exists to prevent.
         if cache_dir is None:
-            from config import MODEL_CACHE_PATH
-            cache_dir = MODEL_CACHE_PATH
+            cache_dir = _default_cache_dir()
         cache_dir = Path(cache_dir)
         cache_dir.mkdir(parents=True, exist_ok=True)
         self.cache_dir = cache_dir

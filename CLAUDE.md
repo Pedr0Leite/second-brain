@@ -47,6 +47,79 @@ returned nothing while reporting success. Guarded by
   `docs/adr/0002`.
 - No GPU passthrough (`nvidia-smi` absent). Treat as CPU-only.
 
+## The corpus is a live, partly machine-written vault
+
+It is not a static dataset. The vault carries its own `CLAUDE.md` ("AI Agent
+Guide") describing layers that other tools write to continuously. Read it before
+assuming anything about corpus stability.
+
+Measured composition and churn:
+
+```bash
+$ find . -name '*.md' | wc -l                     # per top-level dir
+ServiceNowOfficialDocs 51251   Notion 287   wiki 39
+raw/inbox 23           Applications 14      raw/sessions 10   graphify 2
+
+$ find . -name '*.md' -mtime -7 | cut -d/ -f2 | sort | uniq -c | sort -rn
+     24 raw      9 Applications      4 wiki      3 ServiceNowOfficialDocs
+```
+
+**99.3% of the corpus is vendor documentation that barely moves; essentially all
+churn is in the remaining 0.7%.** That is why content-hash incremental sync is the
+right design — a nightly run touches ~40 files, not 51,588. It also means the
+fast-changing material (`wiki/`, `Applications/`, `raw/`) is a rounding error by
+file count while carrying most of the answers to "has this been solved before".
+
+Which layers write themselves, and what it costs us:
+
+| layer | written by | consequence for sn-rag |
+|---|---|---|
+| `wiki/` | an LLM (claude-memory-compiler), continuously | changes with no human action; the nightly sync is load-bearing, not a nicety |
+| `raw/sessions/` | session hooks, automatically, daily | new file per day, **moved** to `raw/sessions/archive/` after ~30 days |
+| `graphify/` | generator, regenerated wholesale | mass rewrites look like mass edits to the manifest |
+| `ServiceNowOfficialDocs/`, `Notion/` | human, curated | effectively immutable |
+
+`prune.py` **moves** archived session logs rather than deleting them. To the
+manifest that is a delete at the old path plus an insert at the new one — correct
+behaviour, but it shows up as churn. Do not mistake it for a bug.
+
+Every top-level directory containing `.md` must appear in `SOURCE_BY_TOP_DIR` or
+ingest fails loudly. Currently exact: 10 directories, 10 classifications, no gaps.
+The vault gains layers over time, so a `ValueError` from `classify_source` after a
+`git pull` means the vault grew, not that ingest broke.
+
+`.smart-env/` is in `EXCLUDED_DIRS` deliberately — it is the Smart Connections
+plugin's own embedding index. Indexing it would mean embedding an index.
+
+### There are two semantic search systems over this one vault
+
+The vault's guide points its agent pipeline (`ba-agent`, `architect`, `developer`)
+at a `semantic_search` MCP tool backed by smart-connections, with `obsidian-cli`
+as fallback. sn-rag is a second, independent stack over the same files.
+
+- **smart-connections** reads an index the Obsidian plugin builds, so it requires
+  the vault to have been **opened in Obsidian**.
+- **sn-rag never needs Obsidian**, enforces caps in code, and has measured token
+  and recall numbers behind it.
+
+Neither supersedes the other on paper. Be explicit about which one produced an
+answer, never mix them in a single response, and never cite one having queried the
+other.
+
+### `index.md` exclusion is the whole point, not a detail
+
+The vault guide tells readers to "read `INDEX.md` first — do not scan directories
+blindly". Those navigation files are exactly what sn-rag replaces:
+
+```bash
+$ find . -name 'index.md' | wc -l        # 54
+$ ...                                    # 19.5 MB total
+```
+
+19.5 MB of link dumps, excluded on purpose. Re-including them would restore the
+token-burning workflow this project exists to remove — the 78.5x measurement was
+taken against precisely that baseline.
+
 ## Evidence rules — non-negotiable
 
 These come from the build spec and are the reason this project is trustworthy.
@@ -91,6 +164,10 @@ the `official` vendor corpus. Never loosen those without an ADR.
 
 Full per-tool reference with caps and signatures lives in `README.md`.
 
+**Both `README.md` and this file sit at the repo root; the code is in `sn-rag/`.**
+Every command in either document is relative to `sn-rag/` — `cd sn-rag` first, or
+`import config` fails and `pytest tests/` collects nothing.
+
 ## Things that will bite you
 
 - **Length-sorted batching is load-bearing.** Batches pad to their longest member
@@ -126,6 +203,16 @@ Full per-tool reference with caps and signatures lives in `README.md`.
 - **`index.md` files are excluded** — 500 KB–2 MB navigation dumps, not content.
 - **Code fences and tables are atomic.** Never split them, even oversized. A
   bisected `GlideRecord` example is wrong, not merely large.
+- **A non-empty buffer can still be blank.** `build_children`'s flush guarded on
+  `if not buf`, so a whitespace-only remnant between sections became a chunk whose
+  text was `"\n"` — 13,174 real vectors in the live index (2.97%), one of which
+  ranked *first* for "incident management". Blank **parents** are left alone on
+  purpose: they must tile the body verbatim, and they are unreachable because
+  `sn_get_section` is only addressable through a child's `parent_id`.
+- **A green suite is not evidence the data is sound.** That defect survived the
+  entire build. It surfaced only because one test asserted on *content*
+  (`hit.text.strip()`) instead of counts and status codes. Prefer at least one
+  assertion per subsystem that would notice empty-but-well-formed output.
 
 ## Golden set
 

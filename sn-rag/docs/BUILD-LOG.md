@@ -1728,3 +1728,113 @@ is pure and property-tested.
 
 This is the same shape as the breadcrumb defect found in Phase 2, which is why it
 is written down rather than waved through.
+
+---
+
+## 2026-08-05 — blank-chunk defect: 13,174 empty vectors in the index
+
+Found by a test that had been passing, after a documentation-only edit session.
+`test_search_returns_populated_hits` failed:
+
+```
+E       AssertionError: payload text missing — snippets would be empty
+E       assert ''
+E        +  where '' = '\n'.strip()
+E             Hit(chunk_id='ee8e5457...', rel_path='ServiceNowOfficialDocs/
+E             operational-technology/.../operational-technology-incident-management.md')
+```
+
+A chunk whose entire text was `"\n"` was the **top hit** for "incident management".
+
+### Cause
+
+`build_children`'s `flush()` guarded only on `if not buf`. A non-empty `buf` can
+still be pure whitespace — a blank-line remnant left between sections — so it
+flushed as its own child. Reproduced deterministically on the source document:
+
+```
+$ python3 -c "... build_children(...)"
+  BLANK child id=ee8e54577b23 text='\n' h_path='Operational Technology Incident Management'
+parents=2 blank_parents=0
+children=7 blank_children=1
+```
+
+### Scale, measured before fixing
+
+```
+$ python3 -c "... random.seed(7); sample 1500 corpus files ..."
+sampled files      : 1500
+children produced  : 14930
+BLANK children     : 432  (2.89%)
+files affected     : 250  (16.7%)
+```
+
+And in the live index, by scrolling every point's payload:
+
+```
+$ python3 -c "... client.scroll(with_payload=['text','rel_path']) ..."
+scanned points     : 443590
+BLANK-text points  : 13174  (2.97%)
+files affected     : 7869
+```
+
+The 2.97% measured on real data matches the 2.89% sample estimate, so the sample
+was representative.
+
+### Fix
+
+`flush()` now discards a whitespace-only buffer instead of emitting it. Same
+sample, same seed, after the change:
+
+```
+children produced : 14498   (was 14930)
+BLANK children    : 0       (was 432)
+```
+
+Exactly 432 fewer children — every removed chunk was blank, nothing else changed.
+
+### Parents are deliberately NOT filtered
+
+Blank *parents* still occur (44 per 1,805 in an 800-file sample) and are left
+alone on purpose: parents must tile the body verbatim
+(`test_parents_reproduce_body_verbatim`), so dropping a remnant would break the
+guarantee that no source text is silently discarded. That is safe only because a
+blank parent has no children, and `sn_get_section` is reachable exclusively
+through a search hit's `parent_id` — i.e. through a child:
+
+```
+parents total        : 1805
+blank parents        : 44
+blank AND reachable  : 0
+```
+
+`test_whitespace_only_parents_are_unreachable` asserts that property, so if blank
+parents ever become addressable the suite fails rather than the behaviour drifting.
+
+### Regression tests, verified able to fail
+
+Ran the new test against the pre-fix code recovered from `git show HEAD:`:
+
+```
+  OLD code: 7 children, 1 blank -> test would FAIL: True
+$ python3 -m pytest tests/ -q
+139 passed
+```
+
+### Data repair
+
+The code fix does not clean the 13,174 already-indexed blank vectors, and the
+running embed job had loaded the old chunker — so it was still producing more. It
+was stopped at 19,100/27,480 and restarted as two chained passes:
+
+1. finish the 8,380 pending files with the fixed chunker;
+2. `embed --paths blank_files.txt` over the 7,868 affected files. Reindex deletes
+   by `rel_path` before upserting, so this replaces their points cleanly rather
+   than layering new ones on top.
+
+Manifest and Qdrant were consistent at the stop point (`match = True`,
+443,590 = 443,590), so the restart began from a clean state.
+
+**Lesson.** A green suite is not evidence the data is sound. This defect was in
+the index for the entire build, and the only reason it surfaced is that one test
+asserted on *content* rather than on counts and status codes.

@@ -100,9 +100,32 @@ and throughput figure downstream.
 **Length-sorted batching is load-bearing, not an optimisation.** Transformer
 batches pad every sequence to the longest member, and this corpus mixes 200-char
 prose with 30,000-char code blocks (the oversized atomic chunks invariant 3
-produces). Sorting by length before batching measured **5.4x** throughput —
-16.9 → 92.4 chunks/sec. Smaller batches beat larger ones, which is backwards from
-the usual advice and only makes sense once padding is understood as the bottleneck.
+produces). Sorting by length before batching is what keeps larger batches viable
+at all.
+
+> **Corrected 2026-08-05.** This section previously claimed 16.9 → **92.4
+> chunks/sec** and concluded that *smaller batches beat larger ones*. Both were
+> wrong, and wrong in the most expensive way: the 92.4 figure came from
+> `bench_embed.py`, which called `embed()` once over a whole list, while
+> production looped batch-by-batch and sustained **6.7**. The number sat here for
+> three phases and funded an overnight plan that was never achievable.
+>
+> Re-measured against the shipped code path, once `Embedder.encode()` stopped
+> looping and handed fastembed the whole length-sorted list:
+>
+> | batch | chunks/s |
+> |---|---|
+> | 8 | 8.0 |
+> | **32** | **12.1** ← chosen |
+> | 64 | 8.9 |
+>
+> So larger batches *do* win up to a point; 64 loses to padding waste, which is
+> the real effect the original claim garbled. Sustained full-corpus throughput on
+> this CPU is **~18 chunks/s** with `EMBED_THREADS=6`.
+>
+> Two lessons, both now in `CLAUDE.md`: benchmark the code path you ship, and
+> isolated measurements do not compose (dense alone 12.1, sparse alone 5,628,
+> combined 8.8).
 
 Qdrant: one collection, named `dense` + `sparse` vectors, int8 scalar quantization
 (`always_ram`), original vectors on disk. Payload indexes on `source`, `doc_type`,
@@ -168,8 +191,19 @@ through ripgrep and promote exact matches above vector hits.
 `eval/run_eval.py` measures recall@5, recall@10, MRR and p50/p95 latency across
 `dense | sparse | hybrid | hybrid+rerank`, per profile.
 
-**Gate: hybrid+rerank recall@10 >= 0.85.** Nothing gets built on top of retrieval
-until it clears.
+**Gate: hybrid+rerank recall@10 >= 0.85.**
+
+**Current state: INCONCLUSIVE — the gate is neither passed nor failed.** It scores
+only cases with `provenance: real` (asked before the answer was known), and there
+are 3 of a required 20; below that threshold `run_eval.py` exits `2` rather than
+reporting a blended number.
+
+The original intent recorded here was "nothing gets built on top of retrieval
+until it clears". That is not what happened: Phase 5 was built on top with the
+gate inconclusive. This is stated rather than quietly reworded, because the
+alternative — declaring the gate passed on constructed cases — would have made
+every downstream number look earned when it was not. The constructed `personal`
+cases score **1.000**; that perfect score *is* the circularity, left visible.
 
 The set itself (`eval/golden.yaml`) is human-authored and cannot be automated — see
 `GOLDEN-SET-GUIDE.md`. The authoring tool's `find` uses filename and ripgrep only,

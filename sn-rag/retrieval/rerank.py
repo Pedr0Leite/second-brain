@@ -16,9 +16,12 @@ class Reranker:
     def __init__(self, model_name: str, threads: int | None = None, cache_dir=None):
         from fastembed.rerank.cross_encoder import TextCrossEncoder
         # Default resolved here, not at the call sites — see Embedder.__init__.
+        # getattr, not a direct import: a long-lived MCP server that imported
+        # `config` before MODEL_CACHE_PATH existed would otherwise ImportError
+        # and take down every tool. See ingest/embed.py:_default_cache_dir.
         if cache_dir is None:
-            from config import MODEL_CACHE_PATH
-            cache_dir = MODEL_CACHE_PATH
+            from ingest.embed import _default_cache_dir
+            cache_dir = _default_cache_dir()
         cache_dir = Path(cache_dir)
         cache_dir.mkdir(parents=True, exist_ok=True)
         self.cache_dir = cache_dir
@@ -30,9 +33,15 @@ class Reranker:
         """Re-score hits against the query and return the top_k, best first."""
         if not hits:
             return []
-        # The breadcrumb is part of what makes a 500-char fragment interpretable,
-        # so the reranker must see the same text the embedder indexed.
-        documents = [f"{h.h_path}\n\n{h.text}" if h.h_path else h.text for h in hits]
+        # The reranker must see the same text shape the embedder indexed —
+        # including the title, now that it is part of the recipe. Scoring a
+        # different representation than was indexed makes the cross-encoder
+        # disagree with retrieval for reasons unrelated to relevance.
+        from ingest.embed import build_embed_text
+        from config import EMBED_DOC_TITLE
+        documents = [build_embed_text(h.text, h.h_path, getattr(h, "doc_title", "") or "",
+                                      h.rel_path, include_title=EMBED_DOC_TITLE)
+                     for h in hits]
         scores = list(self._model.rerank(query, documents))
         ranked = sorted(zip(hits, scores), key=lambda pair: pair[1], reverse=True)
         return [

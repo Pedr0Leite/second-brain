@@ -42,6 +42,16 @@ Two consequences follow, and they explain most of the design:
   `PLANNER_UNAVAILABLE`. There is no hosted route to fail over to, by design — a
   silent fallback would destroy the point while making every metric look good.
 
+> **Where to run things.** This README lives at the repo root, but the project is
+> in `sn-rag/` and **every command below assumes you are inside it**:
+>
+> ```bash
+> cd sn-rag
+> ```
+>
+> Paths like `scripts/second-brain`, `ingest/index.py`, `docs/adr/` and
+> `requirements.txt` are all relative to `sn-rag/`.
+
 ---
 
 ## Contents
@@ -789,7 +799,10 @@ project less trustworthy.
 ## Layout
 
 ```
-sn-rag/
+second-brain/                 repo root — github.com/Pedr0Leite/second-brain
+├── README.md              this file (the GitHub landing page)
+├── .gitignore             excludes manifest.db*, *.log, caches, keys
+└── sn-rag/                everything below is relative to here
 ├── config.py              single source of truth: paths, models, caps, budgets
 ├── requirements.txt
 ├── ingest/

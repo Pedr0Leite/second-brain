@@ -115,7 +115,8 @@ def cmd_embed(args):
     from qdrant_client import QdrantClient, models
     from config import (QDRANT_URL, QDRANT_COLLECTION, DENSE_MODEL, SPARSE_MODEL,
                         EMBED_BATCH_SIZE, EMBED_THREADS, UPSERT_FILE_BATCH, PARENT_CHUNK_MIN_CHARS,
-                        PARENT_CHUNK_MAX_CHARS, CHILD_CHUNK_CHARS, CHILD_CHUNK_OVERLAP)
+                        PARENT_CHUNK_MAX_CHARS, CHILD_CHUNK_CHARS, CHILD_CHUNK_OVERLAP,
+                        EMBED_DOC_TITLE)
     from ingest.chunker import chunk_document
     from ingest.normalize import extract_metadata
     from ingest import embed as embed_mod
@@ -180,7 +181,9 @@ def cmd_embed(args):
                 per_file.append((rel_path, source, [], [], [], meta))
                 continue
             symbols_by_parent = {p.parent_id: list(p.api_symbols) for p in parents}
-            texts = [f"{c.h_path}\n\n{c.text}" if c.h_path else c.text for c in children]
+            texts = [embed_mod.build_embed_text(c.text, c.h_path, meta["doc_title"],
+                                                rel_path, include_title=EMBED_DOC_TITLE)
+                     for c in children]
             per_file.append((rel_path, source, children, parents, texts, meta))
 
         all_texts = [t for _, _, _, _, ts, _ in per_file for t in ts]

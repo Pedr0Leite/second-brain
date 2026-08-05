@@ -152,6 +152,21 @@ SPARSE_MODEL = os.environ.get("SPARSE_MODEL", "Qdrant/bm25")
 # keeps 32 viable at all.
 EMBED_BATCH_SIZE = int(os.environ.get("EMBED_BATCH_SIZE", "32"))
 
+# Prepend the document title (and filename stem) to each child's embedded text.
+#
+# Until 2026-08-05 the embedded text was `h_path + body` only, so a file named
+# `servicenow-sdk-building-ai-agents-guide.md` contributed NOTHING to retrieval
+# under its own name — the only route to it was matching body prose. That is the
+# signal Obsidian's quick switcher and `scripts/golden.py find` both run on, and
+# it is why filename-first tools were beating this system on questions where the
+# user already half-knows the document.
+#
+# Changing this changes the embedding recipe, NOT file content, so content-hash
+# staleness detection cannot see it: flipping the flag makes every existing
+# vector wrong while every file still reads as 'indexed'. The only correct
+# response is a full re-embed (`ingest/index.py embed --recreate`).
+EMBED_DOC_TITLE = os.environ.get("EMBED_DOC_TITLE", "1").lower() not in ("0", "false", "no")
+
 # Cap embedding threads so a long reindex does not starve interactive retrieval.
 # Measured: throughput plateaus at 6 threads (10.2 chunks/s) and 12 is no better
 # (10.0), so this costs nothing. Left unpinned, the reindex took every core and
