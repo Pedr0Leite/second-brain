@@ -18,15 +18,15 @@ anchored to absolute locations, never the working directory:
 
 ```bash
 python3 -c "import config; print(config.CORPUS_PATH, config.MANIFEST_DB_PATH)"
-# /home/pedro/vaults/obsidian-servicenow-docs
-# /home/pedro/.local/state/sn-rag/manifest.db
+# /home/mrmilk/gitHubRepos/obsidian-servicenow-docs
+# /home/mrmilk/.local/state/sn-rag/manifest.db
 ```
 
 Current layout — **both on ext4, deliberately**:
 
 | what | where | why |
 |---|---|---|
-| corpus | `~/vaults/obsidian-servicenow-docs` | lexical search 342x faster than `/mnt/c` |
+| corpus | `~/gitHubRepos/obsidian-servicenow-docs` | lexical search 342x faster than `/mnt/c` |
 | manifest | `~/.local/state/sn-rag/manifest.db` | SQLite fsync 24x faster off 9p |
 | models | `~/.cache/fastembed` (`MODEL_CACHE_PATH`) | fastembed defaults to a tempdir, wiped on reboot |
 | code | `.../second-brain/sn-rag` | on `/mnt/c`; fine, it is read once |
