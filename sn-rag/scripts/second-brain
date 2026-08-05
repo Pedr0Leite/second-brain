@@ -82,7 +82,51 @@ preflight() {
     prog=$(tail -1 "$HOME/.local/state/sn-rag/full-embed.log" 2>/dev/null | tr -s ' ' | sed 's/^ //')
     check "indexing" warn "running — ${prog:-in progress}"
   fi
+  [[ "$qdrant_state" == ok ]] || printf "  ${DIM}start it with: second-brain --up${R}\n"
   printf '\n'
+}
+
+# --- bring services up -------------------------------------------------------
+# Only the two long-running units. The MCP server is deliberately NOT started
+# here: it speaks MCP over stdin/stdout and is spawned per session by Claude
+# Code. A hand-started copy would sit reading your terminal and serve nobody,
+# while looking like the system is running.
+wait_for() {
+  local label="$1" url="$2" tries=30
+  while ((tries--)); do
+    timeout 2 curl -s "$url" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  printf "  ${BAD}%s did not come up within 30s${R}\n" "$label"
+  return 1
+}
+
+bring_up() {
+  local rc=0
+
+  if ! systemctl --user is-active --quiet qdrant.service; then
+    printf "  starting qdrant.service\n"
+    systemctl --user start qdrant.service || rc=1
+    wait_for qdrant "http://localhost:6333/collections" || rc=1
+  fi
+
+  # Ollama is optional: only sn_research needs it, and its absence is a clean
+  # PLANNER_UNAVAILABLE rather than a broken system. Never treat it as fatal,
+  # and never install it from here.
+  if ! timeout 2 curl -s "http://localhost:11434/api/tags" >/dev/null 2>&1; then
+    if systemctl --user list-unit-files ollama.service >/dev/null 2>&1 \
+       && systemctl --user cat ollama.service >/dev/null 2>&1; then
+      printf "  starting ollama\n"
+      systemctl --user start ollama.service 2>/dev/null || true
+      wait_for ollama "http://localhost:11434/api/tags" || true
+    fi
+  fi
+
+  # The timer is enabled at install time; start it if it was stopped by hand.
+  systemctl --user is-active --quiet sn-rag-sync.timer \
+    || systemctl --user start sn-rag-sync.timer 2>/dev/null || true
+
+  return $rc
 }
 
 # --- session picker ----------------------------------------------------------
@@ -165,8 +209,10 @@ usage() {
 
   USAGE
     second-brain                 splash, health checks, then pick a session
+    second-brain --up            start qdrant (+ ollama), report, then exit
     second-brain --resume <id>   resume directly (any claude flag passes through)
     second-brain --status        health checks only, then exit — no session
+    second-brain --down          stop qdrant, ollama and the sync timer
     second-brain --sessions      list recent sessions and exit
     second-brain --help          this text
 
@@ -206,6 +252,21 @@ main() {
     --status)
       splash
       preflight
+      exit 0
+      ;;
+    --up)
+      splash
+      bring_up
+      local up_rc=$?
+      preflight
+      exit $up_rc
+      ;;
+    --down)
+      # Qdrant only. The corpus and manifest are untouched; this stops services,
+      # it does not uninstall anything.
+      systemctl --user stop qdrant.service sn-rag-sync.timer 2>/dev/null || true
+      systemctl --user stop ollama.service 2>/dev/null || true
+      printf "  stopped qdrant, ollama and the sync timer\n"
       exit 0
       ;;
     --sessions)

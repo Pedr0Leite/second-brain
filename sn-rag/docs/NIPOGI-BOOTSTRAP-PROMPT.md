@@ -40,6 +40,28 @@ the code is one level down. `cd sn-rag` first or `import config` fails and
 
 ## Tasks, in order
 
+**0. Check what arrived before doing anything else.** The index transfer is
+driven from the workstation, not from here. Report which of these exist and
+their sizes, then stop if the first two are missing:
+
+```bash
+ls -la ~/qdrant-snapshots/ 2>/dev/null          # expect knowledge-*.snapshot, ~2-3 GB
+ls -la ~/.local/state/sn-rag/manifest.db        # expect ~527 MB
+ls -d ~/.cache/fastembed 2>/dev/null            # optional, ~297 MB, re-downloads if absent
+```
+
+A missing snapshot is not a reason to embed. It is a reason to stop and say the
+transfer has not happened. Restore it **after** Qdrant is running (task 3):
+
+```bash
+curl -X POST 'http://127.0.0.1:6333/collections/knowledge/snapshots/upload' \
+     -H 'content-type:multipart/form-data' \
+     -F "snapshot=@$HOME/qdrant-snapshots/<file>.snapshot"
+```
+
+Only `knowledge` matters. Any `sample_*` collection on the source is throwaway
+evaluation scaffolding — do not transfer or recreate it.
+
 **1. Record the hardware.** CPU model, core/thread count, total RAM, free disk,
 whether `nvidia-smi` exists, and the filesystem type of the paths below. Compare
 against the workstation baseline in ADR-0005 (Ryzen 5 9600X, 6c/12t, 25 GB, no
@@ -87,6 +109,26 @@ real query through `sn_search`, not just a tool listing.
 **8. Measure this box against the workstation.** Embedding throughput on a small
 sample, and `sn_search` p50/p95. Do not run a full eval — the golden set gate is
 INCONCLUSIVE (3 real cases, needs 20) and re-running it here proves nothing new.
+
+**9. Make the workstation able to reach it — over SSH, not over a port.** Do not
+open `--http`. Instead confirm this box can serve the MCP server as an SSH stdio
+child, which is what the workstation will register:
+
+```bash
+ssh <this-box> 'cd ~/sn-rag && python3 mcp_server/server.py' < /dev/null
+```
+
+It should start and exit on EOF without a traceback. Report the exact repo path
+and the username, since the workstation needs them verbatim. If `python3` is not
+found under a non-interactive SSH session, that is the finding — non-login shells
+do not read the same profile, and the fix is an absolute interpreter path in the
+command, not editing `~/.zshrc`.
+
+This is a refinement of the SSH option ADR-0006 rejected. The rejection was aimed
+at `ssh -L` port forwards, which must be up before Claude Code spawns; here `ssh`
+*is* the child process, so it starts on demand and a dropped link exits cleanly
+as an MCP disconnect. If it works, say so — it is grounds to amend ADR-0006
+rather than build the token auth.
 
 ## Then stop and report
 

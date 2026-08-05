@@ -66,7 +66,7 @@ echo "  manifest: $MANIFEST"
 echo
 
 # --- 1. slash command ------------------------------------------------------
-echo "[1/2] /second-brain command -> $COMMAND_DST"
+echo "[1/3] /second-brain command -> $COMMAND_DST"
 run mkdir -p "$COMMAND_DIR"
 if [ -f "$COMMAND_DST" ] && ! cmp -s "$COMMAND_SRC" "$COMMAND_DST"; then
   # Never silently overwrite an edited command: the user may have tuned it.
@@ -78,7 +78,7 @@ run cp "$COMMAND_SRC" "$COMMAND_DST"
 echo "  ok"
 
 # --- 2. MCP server ---------------------------------------------------------
-echo "[2/2] MCP server 'sn-rag' (scope: $SCOPE)"
+echo "[2/3] MCP server 'sn-rag' (scope: $SCOPE)"
 # `claude mcp add` errors if the name already exists, so remove first. The
 # remove is allowed to fail — on a fresh machine there is nothing to remove.
 if [ "$DRY" = 0 ]; then
@@ -90,10 +90,29 @@ run claude mcp add sn-rag --scope "$SCOPE" \
   -- python3 "$SERVER"
 echo "  ok"
 
+# --- 3. launcher on PATH ---------------------------------------------------
+# A symlink, not a copy: the launcher resolves the repo through readlink -f on
+# its own path, so a copy in ~/.local/bin would look for the repo in ~/.local
+# and find nothing. It also means a git pull updates the command in place.
+BIN_DIR="$HOME/.local/bin"
+LAUNCHER="$REPO_ROOT/scripts/second-brain"
+echo "[3/3] 'second-brain' launcher -> $BIN_DIR/second-brain"
+run mkdir -p "$BIN_DIR"
+run ln -sfn "$LAUNCHER" "$BIN_DIR/second-brain"
+# The exec bit does not survive a clone from a checkout with core.filemode
+# false, which is how this repo is authored — set it here rather than relying
+# on the index mode alone.
+run chmod +x "$LAUNCHER"
+case ":$PATH:" in
+  *":$BIN_DIR:"*) echo "  ok" ;;
+  *) echo "  ok — but $BIN_DIR is not on PATH; add it to your shell profile" ;;
+esac
+
 echo
 echo "done. verify with:"
+echo "  second-brain --status"
 echo "  claude mcp list"
-echo "  systemctl --user is-active qdrant.service"
 echo
+echo "start the services:  second-brain --up"
 echo "then, in a NEW Claude Code session:  /second-brain what is a business rule"
 echo "(a session started before this runs will not see either change)"

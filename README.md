@@ -498,10 +498,20 @@ Everything you can run, in one place. All paths are relative to `sn-rag/`.
 | command | does |
 |---|---|
 | `second-brain` | splash, health checks, session picker |
+| `second-brain --up` | start Qdrant (+ Ollama, + the sync timer), then report |
 | `second-brain --status` | health checks only, then exit — no session |
+| `second-brain --down` | stop those services; touches no data |
 | `second-brain --sessions` | list recent sessions and exit |
 | `second-brain --help` | usage |
 | `second-brain --resume <id>` | resume directly; any `claude` flag passes through |
+
+`--up` is the closest thing to "start sn-rag", but note what it does *not* do:
+the MCP server is not a service. It speaks MCP over stdin/stdout and Claude Code
+spawns one per session. Starting a copy by hand would sit reading your terminal,
+serve nobody, and look like a running system. `--up` therefore starts only the
+two things that genuinely are long-running — Qdrant, and optionally Ollama.
+Ollama being down is not an error: only `sn_research` needs it, and its absence
+is a clean `PLANNER_UNAVAILABLE`.
 
 ### Indexing
 
