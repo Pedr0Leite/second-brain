@@ -77,7 +77,7 @@ flowchart TB
     subgraph ingest["Ingest — runs offline, never during a query"]
         W["walk + classify<br/>source from top-level dir<br/>skips .git / .obsidian / index.md"]
         C["chunk hierarchically<br/>parent 2-4k chars = context<br/>child 500 chars = search unit<br/>code fences + tables ATOMIC"]
-        E["embed<br/>bge-base-en-v1.5 768d dense<br/>+ BM25 sparse<br/>length-sorted batches of 32"]
+        E["embed<br/>bge-small-en-v1.5 384d dense<br/>+ BM25 sparse<br/>length-sorted batches of 32"]
         W --> C --> E
     end
 
@@ -100,7 +100,7 @@ flowchart TB
     end
 
     subgraph mcp["MCP server — stdio, spawned per session"]
-        T["sn_search · sn_get_section · sn_outline<br/>sn_lexical · sn_research · sn_stats · sn_ingest"]
+        T["sn_search · sn_get_section · sn_outline<br/>sn_lexical · sn_research · sn_stats<br/>+ sn_ingest (stdio only — never over HTTP)"]
         CAP["caps enforced IN CODE<br/>never as prompt instructions"]
         T --> CAP
     end
@@ -204,7 +204,7 @@ endpoint is exactly the accident this project exists to prevent.
 
 | role | model | why |
 |---|---|---|
-| dense | `BAAI/bge-base-en-v1.5` (768d) | bge-small was only 1.5× faster, not the 3× that would justify halving dimensions |
+| dense | `BAAI/bge-small-en-v1.5` (384d) | re-measured: **2.7×** faster than bge-base through the shipped pipeline (8.8 vs 3.3 chunks/s), not the 1.5× previously recorded. Halves vector storage and did not regress recall×10 — ADR-0007 |
 | sparse | `Qdrant/bm25` | exact term matching for API symbols |
 | rerank | `Xenova/ms-marco-MiniLM-L-6-v2` | 50 candidates → top 8 |
 | planner | `qwen2.5:3b-instruct` | JSON only; ~20.7 tok/s on this CPU |
@@ -356,11 +356,44 @@ Manual equivalent, if you'd rather not run a script:
 
 ```bash
 claude mcp add sn-rag --scope user \
-  --env CORPUS_PATH=$HOME/vaults/obsidian-servicenow-docs \
+  --env CORPUS_PATH=$HOME/gitHubRepos/obsidian-servicenow-docs \
   --env MANIFEST_DB_PATH=$HOME/.local/state/sn-rag/manifest.db \
   -- python3 /full/path/to/sn-rag/mcp_server/server.py
 cp scripts/commands/second-brain.md ~/.claude/commands/
 ```
+
+### Serving other machines over HTTP (ADR-0006)
+
+The above is **stdio** — one server process per session, client and server on the
+same box. To let a laptop query an index that lives on a server, run the server
+over authenticated HTTP instead:
+
+```bash
+export SN_RAG_TOKEN=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
+python3 mcp_server/server.py --http --bind 100.x.y.z --port 8079
+```
+
+Clients then register a URL rather than a command:
+
+```bash
+claude mcp add --transport http sn-rag http://100.x.y.z:8079/mcp -s user \
+  --header "Authorization: Bearer $SN_RAG_TOKEN"
+```
+
+Three things are enforced **in code**, not by convention:
+
+- `--bind` is **required**. There is no default and `0.0.0.0` is refused outright
+  — bind a specific private address (Tailscale or LAN).
+- A missing, empty or under-16-character `SN_RAG_TOKEN` makes the server **refuse
+  to start**. It never runs unauthenticated.
+- **`sn_ingest` is not registered over HTTP at all.** The HTTP surface is six
+  tools; the writer is absent from `tools/list` and a direct call returns
+  `Unknown tool`. Writes happen over stdio on the machine that owns the vault.
+
+> **Bind your datastores to loopback too.** Qdrant has *no* authentication and
+> defaults to `0.0.0.0`; so does Ollama. An authenticated MCP server in front of
+> a datastore that answers the network directly protects nothing. Verify with
+> `ss -ltnp | grep -E '6333|11434'` — both must show `127.0.0.1`.
 
 ### 7. Verify
 
@@ -387,7 +420,8 @@ spawned once per session and caches its modules at spawn.
 at hour six is expensive.
 
 ```bash
-python3 ingest/index.py full --limit 500 --shuffle    # sample gate
+python3 ingest/index.py full                          # scan corpus -> manifest
+python3 ingest/index.py embed --limit 500 --shuffle   # sample gate
 python3 ingest/index.py status                        # must report match = True
 ```
 
@@ -593,7 +627,8 @@ python3 ingest/index.py full && python3 ingest/index.py embed
 First index of a new corpus — sample before committing hours:
 
 ```bash
-python3 ingest/index.py full --limit 500 --shuffle    # gate
+python3 ingest/index.py full                          # scan corpus -> manifest
+python3 ingest/index.py embed --limit 500 --shuffle   # gate
 python3 ingest/index.py status                        # match = True
 setsid nohup python3 ingest/index.py embed --shuffle \
   >> ~/.local/state/sn-rag/full-embed.log 2>&1 < /dev/null &
@@ -759,7 +794,7 @@ variable override.
 |---|---|
 | `QDRANT_URL` | `http://localhost:6333` |
 | `QDRANT_COLLECTION` | `knowledge` |
-| `DENSE_MODEL` | `BAAI/bge-base-en-v1.5` |
+| `DENSE_MODEL` | `BAAI/bge-small-en-v1.5` — 384d; changing this changes vector dim and needs `embed --recreate` |
 | `SPARSE_MODEL` | `Qdrant/bm25` |
 | `EMBED_BATCH_SIZE` | `32` — measured 8→8.0, 32→12.1, 64→8.9 chunks/s |
 | `EMBED_THREADS` | `6` — plateaus here; uncapped it starved the planner for hours |

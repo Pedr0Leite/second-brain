@@ -136,7 +136,21 @@ MODEL_CACHE_PATH = Path(
 # Embedding / vector store (Phase 3)
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
 QDRANT_COLLECTION = os.environ.get("QDRANT_COLLECTION", "knowledge")
-DENSE_MODEL = os.environ.get("DENSE_MODEL", "BAAI/bge-base-en-v1.5")
+# bge-small, not bge-base: 384-dim. See docs/adr/0007. Measured A/B over an
+# identical 523-file haystack (500 shuffled + the 23 golden expected docs),
+# only the dense model varying:
+#
+#     model                dim  index rate  servicenow r@10  hybrid+rerank r@10
+#     bge-base-en-v1.5     768   3.3 ch/s        0.909             0.818
+#     bge-small-en-v1.5    384   8.8 ch/s        0.909             0.909   <- chosen
+#     all-MiniLM-L6-v2     384  34.2 ch/s        0.909             0.909
+#
+# recall@10 ties because a 523-file haystack saturates it; MRR does not, and it
+# degrades in model-size order (0.795 / 0.705 / 0.615), which is why the 10x
+# faster MiniLM was rejected. 384-dim also halves vector storage on the target
+# N100 server. Changing this changes the vector dimension: the collection must
+# be rebuilt with `embed --recreate`, never mixed with 768-dim points.
+DENSE_MODEL = os.environ.get("DENSE_MODEL", "BAAI/bge-small-en-v1.5")
 SPARSE_MODEL = os.environ.get("SPARSE_MODEL", "Qdrant/bm25")
 # Re-measured 2026-08-04 on real corpus chunks, once Embedder.encode stopped
 # looping batch-by-batch and handed fastembed the whole length-sorted list:

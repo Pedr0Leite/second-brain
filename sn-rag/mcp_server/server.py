@@ -244,8 +244,10 @@ def sn_stats() -> dict:
                     "qdrant_points": points, "drift": drift, "consistent": drift == 0})
 
 
-@server.tool(description="Migrate a file into the vault, index and embed it. Completes before "
-                         "returning, so the document is immediately searchable.")
+# NOT decorated: registered conditionally at the bottom of this file, and only
+# for stdio. ADR-0006 keeps the single writing tool off the network surface
+# entirely rather than guarding it with a permission check — an unadvertised
+# tool cannot be called, which is verifiable by reading `tools/list`.
 def sn_ingest(source_path: Optional[str] = None, content: Optional[str] = None,
               filename: Optional[str] = None, dest: Optional[str] = None,
               source_class: str = "personal", overwrite: bool = False) -> dict:
@@ -277,11 +279,65 @@ def sn_ingest(source_path: Optional[str] = None, content: Optional[str] = None,
     return caps.ok({**receipt, "summary": text})
 
 
-if __name__ == "__main__":
-    if "--http" in sys.argv:
-        server.settings.host = "0.0.0.0"
-        server.settings.port = int(sys.argv[sys.argv.index("--http") + 1]) \
-            if len(sys.argv) > sys.argv.index("--http") + 1 else 8079
-        server.run(transport="streamable-http")
-    else:
+WRITE_TOOLS = ("sn_ingest",)
+
+
+def register_tools(transport: str) -> list[str]:
+    """Register the tool surface for a transport and return the tool names.
+
+    Read tools are registered by decorator at import. The writer is added here,
+    for stdio only. Returning the names lets a test assert on the surface
+    without starting a server.
+    """
+    if transport == "stdio":
+        server.tool(
+            description="Migrate a file into the vault, index and embed it. Completes "
+                        "before returning, so the document is immediately searchable."
+        )(sn_ingest)
+    return sorted(t.name for t in server._tool_manager.list_tools())
+
+
+def main(argv: list[str]) -> int:
+    from mcp_server import http_serve
+
+    try:
+        cfg = http_serve.parse_serve_args(argv)
+    except http_serve.ConfigError as exc:
+        print(f"sn-rag: {exc}", file=sys.stderr)
+        return 2
+
+    if cfg.transport == "stdio":
+        register_tools("stdio")
         server.run()
+        return 0
+
+    # HTTP: token is resolved BEFORE the socket is opened, so a missing token can
+    # never result in a running-but-open server.
+    try:
+        token = http_serve.require_token()
+    except http_serve.ConfigError as exc:
+        print(f"sn-rag: {exc}", file=sys.stderr)
+        return 2
+
+    names = register_tools("http")
+    if any(w in names for w in WRITE_TOOLS):
+        # Defence in depth: if a future edit decorates sn_ingest again, refuse to
+        # serve rather than quietly publishing a writer to the network.
+        print(f"sn-rag: refusing to serve write tools over HTTP: {names}", file=sys.stderr)
+        return 2
+
+    import logging
+    import uvicorn
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    app = server.streamable_http_app()
+    app.add_middleware(http_serve.build_auth_middleware(token))
+
+    print(f"sn-rag: HTTP on {cfg.host}:{cfg.port}, {len(names)} tools, auth required",
+          file=sys.stderr)
+    uvicorn.run(app, host=cfg.host, port=cfg.port, log_level="info")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1838,3 +1838,190 @@ Manifest and Qdrant were consistent at the stop point (`match = True`,
 **Lesson.** A green suite is not evidence the data is sound. This defect was in
 the index for the entire build, and the only reason it surfaced is that one test
 asserted on *content* rather than on counts and status codes.
+
+---
+
+## Phase 7 — remote MCP over authenticated HTTP (ADR-0006), and the dense model swap (ADR-0007)
+
+Date: 2026-08-05
+
+### Dense model A/B — bge-base vs bge-small vs MiniLM
+
+The full-corpus embed had never been run. Doing so exposed the cost of the
+768-dim default:
+
+```bash
+$ python3 ingest/index.py embed --limit 500 --shuffle
+DONE files=500 chunks=4801 elapsed=1473.7s rate=3.3 chunks/s
+```
+
+~490,000 chunks at 3.3 chunks/s is a **~41 hour** run. Three models were compared
+over an **identical haystack** — the same 500 shuffled files plus the 23 golden
+expected documents (523 files) — with separate collections and manifests so no
+run contaminated another, and only `DENSE_MODEL` varying:
+
+```bash
+$ ... DENSE_MODEL=BAAI/bge-base-en-v1.5 ...
+DONE files=500 chunks=4801 elapsed=1473.7s rate=3.3 chunks/s
+$ ... DENSE_MODEL=BAAI/bge-small-en-v1.5 ...
+DONE files=500 chunks=4801 elapsed=543.8s  rate=8.8 chunks/s
+$ ... DENSE_MODEL=sentence-transformers/all-MiniLM-L6-v2 ...
+DONE files=500 chunks=4801 elapsed=140.2s  rate=34.2 chunks/s
+```
+
+Identical chunk counts (4,801) confirm the chunker is model-independent.
+
+`python3 eval/run_eval.py`, **servicenow profile, 13 cases**:
+
+| model | dim | index rate | dense r@10 | hybrid+rerank r@10 | dense MRR | dense p50 |
+|---|---|---|---|---|---|---|
+| bge-base-en-v1.5 | 768 | 3.3 ch/s | 0.909 | 0.818 | 0.795 | 204 ms |
+| **bge-small-en-v1.5** | **384** | **8.8 ch/s** | **0.909** | **0.909** | **0.705** | **90 ms** |
+| all-MiniLM-L6-v2 | 384 | 34.2 ch/s | 0.909 | 0.909 | 0.615 | 167 ms |
+
+**A near-miss worth recording.** The first attempt to run this eval would have
+produced a meaningless three-way tie. Only 500 of 51,588 files were indexed, and
+a coverage check found **0 of 29** scoreable golden cases had their expected
+document in the sample — every model would have scored 0.000 for reasons having
+nothing to do with the model. The 23 golden documents were indexed into all three
+collections before scoring. Checking coverage before trusting an eval is now part
+of the procedure.
+
+recall@10 ties at 0.909 across all three because a 523-file haystack **saturates
+it**. MRR has not saturated and degrades monotonically with model capacity
+(0.795 → 0.705 → 0.615), which is why the 10x-faster MiniLM was rejected — see
+ADR-0007. These are constructed cases; the Phase 4 gate is still INCONCLUSIVE
+(3 real, needs 20) and none of this changes that.
+
+Full index relaunched with bge-small, sustaining the predicted rate:
+
+```bash
+$ tail -1 ~/.local/state/sn-rag/full-embed.log
+  150/51588 files  3063 chunks  8.1 chunks/s  embedded_calls=3063
+```
+
+### ADR-0006 evidence
+
+**1. `--http` refuses to start unsafely** (all exit 2):
+
+```bash
+$ env -u SN_RAG_TOKEN python3 mcp_server/server.py --http --bind 127.0.0.1
+sn-rag: SN_RAG_TOKEN is unset or empty; refusing to start an unauthenticated
+HTTP server. ...
+exit=2
+
+$ SN_RAG_TOKEN=... python3 mcp_server/server.py --http
+sn-rag: --http requires --bind ADDR ... There is no default: binding 0.0.0.0
+would publish a private corpus to every interface.
+exit=2
+
+$ SN_RAG_TOKEN=... python3 mcp_server/server.py --http --bind 0.0.0.0
+sn-rag: --bind 0.0.0.0 is refused: it exposes the corpus on every interface.
+exit=2
+```
+
+**2. Token enforced at the transport** (server on `127.0.0.1:8079`):
+
+```bash
+$ curl -o /dev/null -w "HTTP %{http_code}\n" -X POST localhost:8079/mcp ...          # no token
+HTTP 401
+$ ... -H "Authorization: Bearer wrong-token-here-abcdefgh" ...
+HTTP 401
+$ ... -H "Authorization: Bearer $SN_RAG_TOKEN" ...
+HTTP 200
+```
+
+**3. `tools/list` over HTTP returns six tools; the writer is absent:**
+
+```
+tools/list over HTTP: 6
+    sn_get_section  sn_lexical  sn_outline  sn_research  sn_search  sn_stats
+sn_ingest present: False
+```
+
+Absent, not merely blocked — a direct call is rejected by the dispatcher:
+
+```json
+{"jsonrpc":"2.0","id":3,"result":{"content":[{"text":"Unknown tool: sn_ingest",
+ "type":"text"}],"isError":true}}
+```
+
+**4. Bound interfaces — this check found a pre-existing hole:**
+
+```bash
+$ ss -ltnp | grep -E "8079|6333|11434"
+LISTEN 127.0.0.1:8079   users:(("python3",pid=1738454))   # MCP, correct
+LISTEN   0.0.0.0:6333   users:(("qdrant",pid=1685674))    # exposed
+LISTEN   0.0.0.0:11434                                    # exposed
+
+$ curl -s http://192.168.1.235:6333/collections
+{"result":{"collections":[{"name":"knowledge"},{"name":"knowledge_bgesmall"},
+ {"name":"knowledge_minilm"}]},"status":"ok","time":0.000017835}
+```
+
+Bare metal, LAN addresses `192.168.1.235`/`192.168.1.90` — not a NAT-shielded WSL
+guest, so the exposure was real. Qdrant has no authentication, so any LAN host
+could read, snapshot or DELETE the index, bypassing the bearer token entirely.
+The unauthenticated datastore was a wider hole than the MCP port this ADR was
+written to protect.
+
+`QDRANT__SERVICE__HOST=127.0.0.1` added to the user unit. **Staged, not active** —
+restarting Qdrant mid-embed would abort the 15h index. Outstanding: restart
+Qdrant after the index completes and re-run `ss`; bind Ollama to loopback (root
+service, needs sudo).
+
+**5. Cross-machine `sn_search` — NOT YET RUN.** The port has not been opened
+beyond loopback, so this remains outstanding and ADR-0006 item 5 is unmet.
+
+### Tests
+
+```bash
+$ python3 -m pytest tests/test_http_auth.py -q
+26 passed in 2.28s
+```
+
+Both mutations were verified to fail the suite, per the project rule that a test
+passing first try must be shown capable of failing:
+
+```bash
+# token_matches -> return True
+FAILED test_bad_authorization_headers_all_rejected[Bearer wrong-token...]
+FAILED test_middleware_enforces_token_on_mcp_path[headers1-401]
+FAILED test_unauthenticated_request_is_not_logged_with_the_token
+3 failed, 23 passed
+
+# --bind optional, defaulting to 0.0.0.0 (the original bug)
+FAILED test_http_without_bind_is_refused
+1 failed, 25 passed
+```
+
+### Full suite under index load
+
+```bash
+$ python3 -m pytest tests/ -q
+4 failed, 165 passed, 1 skipped in 155.06s
+FAILED tests/test_planner.py::test_plan_returns_queries_and_a_valid_agent
+FAILED tests/test_planner.py::test_plan_routes_vendor_questions_to_the_servicenow_agent
+FAILED tests/test_planner.py::test_plan_preserves_technical_identifiers_verbatim
+FAILED tests/test_planner.py::test_plan_is_bounded_in_latency
+# agent.planner.PlannerUnavailable: local planner unreachable: timed out
+```
+
+Not a regression — the documented CPU-starvation mode, with the full embed
+holding ~6 cores:
+
+```bash
+$ uptime
+ 19:13:31  up 52 days,  load average: 22.24, 17.91, 16.40      # 16 cores
+
+$ curl -s localhost:11434/api/tags -o /dev/null -w "%{http_code} %{time_total}s\n"
+200 0.005007s                                    # server up
+
+$ time curl -s localhost:11434/v1/chat/completions -d '{...,"max_tokens":5}'
+19.459 total                                     # 5 tokens, 19.5s
+```
+
+Ollama answers trivial HTTP instantly but cannot get scheduled for inference.
+The failure is the correct one (`PLANNER_UNAVAILABLE`, never a silent fallback to
+a paid route). `git diff --stat HEAD -- agent/ retrieval/` is empty: this change
+touched neither. Re-run the planner tests once the index finishes.

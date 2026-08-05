@@ -162,6 +162,26 @@ silent fallback.
 absolute paths, `..`, symlink escapes, null bytes, non-markdown, and writes into
 the `official` vendor corpus. Never loosen those without an ADR.
 
+**The surface is transport-dependent (ADR-0006).** Over stdio: seven tools. Over
+HTTP: **six** — `sn_ingest` is not registered at all, so it is absent from
+`tools/list` and a direct call returns `Unknown tool`. It is not
+permission-checked, because an unadvertised tool is verifiable by reading the
+tool list while a permission check is only as good as its implementation.
+`register_tools()` in `server.py` is the single place this is decided, and
+`main()` refuses to serve if a write tool ever appears on the HTTP surface.
+
+HTTP mode refuses to start without `--bind` (no default; `0.0.0.0` rejected) or
+without a `SN_RAG_TOKEN` of at least 16 characters.
+
+**Qdrant and Ollama must be bound to `127.0.0.1`.** Qdrant has no authentication
+and defaults to `0.0.0.0`; on 2026-08-05 the whole index was listable and
+deletable from any host on the LAN. An authenticated MCP server in front of a
+datastore that answers the network directly protects nothing:
+
+```bash
+ss -ltnp | grep -E '6333|11434'      # both must show 127.0.0.1
+```
+
 Full per-tool reference with caps and signatures lives in `README.md`.
 
 **Both `README.md` and this file sit at the repo root; the code is in `sn-rag/`.**

@@ -1,7 +1,10 @@
 # ADR-0006: Remote MCP — serve reads over authenticated HTTP, keep the writer local
 
 **Date:** 2026-08-05
-**Status:** Proposed — nothing implemented, no token issued, no port opened
+**Status:** Accepted — implemented 2026-08-05 in `mcp_server/http_serve.py`.
+Auth, bind validation and the six-tool surface are built and evidenced below.
+The port is **not yet opened beyond loopback**: that remains gated on retrieval
+quality, per "Sequencing" below.
 **Phase:** 7 (operations)
 **Follows:** ADR-0005 (how the index gets to the server), ADR-0003 (the tool surface)
 
@@ -169,10 +172,46 @@ needed.
 Per the project's evidence rules, none of the following may be asserted without
 pasted command output in `BUILD-LOG.md`:
 
-1. `--http` without `SN_RAG_TOKEN` set **refuses to start** (paste the exit).
-2. A request with no token, and one with a wrong token, both return 401.
-3. `tools/list` over HTTP returns **six** tools, and `sn_ingest` is absent.
-4. `ss -ltnp` on the server shows the MCP port bound to the private interface
-   only, and 6333/11434 bound to `127.0.0.1`.
-5. End-to-end `sn_search` from a second machine, with latency compared against
-   the same query run locally on the server.
+1. ✅ `--http` without `SN_RAG_TOKEN` set **refuses to start** (paste the exit).
+2. ✅ A request with no token, and one with a wrong token, both return 401.
+3. ✅ `tools/list` over HTTP returns **six** tools, and `sn_ingest` is absent.
+4. ⚠️ `ss -ltnp` on the server shows the MCP port bound to the private interface
+   only, and 6333/11434 bound to `127.0.0.1`. — **MCP yes; see below.**
+5. ⬜ End-to-end `sn_search` from a second machine, with latency compared against
+   the same query run locally on the server. — **not yet run.**
+
+Full output in `BUILD-LOG.md`, Phase 7.
+
+## Item 4 found a pre-existing hole, and it was the more serious one
+
+Running the check the ADR itself demanded surfaced that the datastores had been
+exposed all along:
+
+```bash
+$ ss -ltnp | grep -E "8079|6333|11434"
+LISTEN 127.0.0.1:8079   users:(("python3",...))    # MCP, correct
+LISTEN   0.0.0.0:6333   users:(("qdrant",...))     # <-- every interface
+LISTEN   0.0.0.0:11434                             # <-- every interface
+
+$ curl -s http://192.168.1.235:6333/collections     # from the box's own LAN IP
+{"result":{"collections":[{"name":"knowledge"},...]},"status":"ok"}
+```
+
+This box is bare metal with LAN addresses `192.168.1.235` / `192.168.1.90`, not a
+NAT-shielded WSL guest, so the exposure was real rather than theoretical. Qdrant
+has **no authentication**, so any host on the subnet could read, snapshot or
+`DELETE` the entire index — bypassing the bearer token entirely.
+
+That inverts part of this ADR's reasoning. The stated risk was "opening an MCP
+port widens access"; in fact access was already wider than the MCP port would
+have made it, and the datastore had no auth at all where the MCP surface at
+least has one. **Putting an authenticated proxy in front of an unauthenticated
+datastore that also answers the network directly buys nothing.**
+
+Fix applied: `QDRANT__SERVICE__HOST=127.0.0.1` in the user unit
+(`~/.config/systemd/user/qdrant.service`). Staged, not yet active — a restart
+mid-index would abort the 15h full embed. **Two actions remain outstanding:**
+
+- restart `qdrant.service` once the full index completes, then re-run `ss -ltnp`
+- bind Ollama to loopback (`OLLAMA_HOST=127.0.0.1` in
+  `/etc/systemd/system/ollama.service`); it runs as root, so this needs sudo
