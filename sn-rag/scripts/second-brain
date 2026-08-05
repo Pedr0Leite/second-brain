@@ -1,0 +1,214 @@
+#!/usr/bin/env bash
+# Launcher for the second brain: splash, preflight, session picker, then exec claude.
+#
+# Cosmetic on purpose, but the preflight is not: Qdrant down means every search
+# fails, and a stale MCP server means sn_get_section returns NOT_FOUND while
+# sn_search still works. Both have happened. Better to see it before asking a
+# question than to debug it mid-conversation.
+#
+# Install:  ln -s "$PWD/scripts/second-brain" ~/.local/bin/second-brain
+set -uo pipefail
+
+SN_RAG_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+PROJECT_DIR="$(dirname "$SN_RAG_DIR")"
+SESSION_DIR="$HOME/.claude/projects/$(echo "$PROJECT_DIR" | sed 's|/|-|g')"
+
+# Colour only when attached to a terminal that wants it; NO_COLOR is honoured so
+# this stays usable when piped or logged.
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  P='\033[38;5;218m'; PB='\033[1;38;5;211m'; DIM='\033[2m'
+  OK='\033[38;5;114m'; BAD='\033[38;5;203m'; WARN='\033[38;5;222m'; R='\033[0m'
+else
+  P=''; PB=''; DIM=''; OK=''; BAD=''; WARN=''; R=''
+fi
+
+splash() {
+  printf '\n'
+  # Quoted heredoc: the art is full of backslashes, backticks and braces, and a
+  # single unquoted expansion would mangle it. Each line is passed as an ARGUMENT
+  # to printf, never as the format string, so a stray % in future art is inert.
+  while IFS= read -r line; do
+    printf "${P}    %s${R}\n" "$line"
+  done <<'BRAIN'
+      _---~~(~~-_.
+    _{        )   )
+  ,   ) -~~- ( ,-' )_
+ (  `-,_..`., )-- '_,)
+( ` _)  (  -~( -_ `,  }
+(_-  _  ~_-~~~~`,  ,' )
+  `~ -^(    __;-,((()))
+        ~~~~ {_ -_(())
+               `\  }
+                 { }
+BRAIN
+  printf "\n${PB}        S E C O N D   B R A I N${R}\n"
+  printf "${DIM}      local retrieval · no paid models${R}\n\n"
+}
+
+# --- preflight ---------------------------------------------------------------
+# Every check is bounded by a timeout: a hung service must not hang the launcher.
+check() {
+  local label="$1" state="$2" detail="${3:-}"
+  case "$state" in
+    ok)   printf "  ${OK}●${R} %-9s ${DIM}%s${R}\n" "$label" "$detail" ;;
+    warn) printf "  ${WARN}●${R} %-9s ${DIM}%s${R}\n" "$label" "$detail" ;;
+    *)    printf "  ${BAD}●${R} %-9s ${DIM}%s${R}\n" "$label" "$detail" ;;
+  esac
+}
+
+preflight() {
+  local qdrant_state=bad qdrant_detail="not responding on :6333 — searches will fail"
+  local points
+  points=$(timeout 5 curl -s "http://localhost:6333/collections/knowledge" 2>/dev/null \
+           | grep -o '"points_count":[0-9]*' | head -1 | cut -d: -f2)
+  if [[ -n "${points:-}" ]]; then
+    qdrant_state=ok
+    # sed, not printf "%'d" — thousands grouping depends on locale and silently
+    # does nothing under LC_ALL=C, which is how this runs from a systemd unit.
+    qdrant_detail="$(echo "$points" | sed -e :a -e 's/\(.*[0-9]\)\([0-9]\{3\}\)/\1,\2/;ta') vectors"
+  fi
+  check "qdrant" "$qdrant_state" "$qdrant_detail"
+
+  if timeout 5 curl -s "http://localhost:11434/api/tags" >/dev/null 2>&1; then
+    check "planner" ok "ollama up — sn_research available"
+  else
+    check "planner" warn "ollama down — sn_research returns PLANNER_UNAVAILABLE"
+  fi
+
+  # An indexing job in flight is worth knowing about: it holds EMBED_THREADS
+  # cores and the index is incomplete, so recall is a lower bound.
+  local prog
+  if pgrep -f 'index.py embed' >/dev/null 2>&1; then
+    prog=$(tail -1 "$HOME/.local/state/sn-rag/full-embed.log" 2>/dev/null | tr -s ' ' | sed 's/^ //')
+    check "indexing" warn "running — ${prog:-in progress}"
+  fi
+  printf '\n'
+}
+
+# --- session picker ----------------------------------------------------------
+# Lists recent transcripts newest-first with their opening prompt, because a bare
+# UUID tells you nothing about which conversation it was.
+list_sessions() {
+  [[ -d "$SESSION_DIR" ]] || return 1
+  local files=()
+  while IFS= read -r f; do files+=("$f"); done < <(ls -t "$SESSION_DIR"/*.jsonl 2>/dev/null | head -9)
+  [[ ${#files[@]} -gt 0 ]] || return 1
+
+  SESSION_IDS=()
+  local i=1
+  for f in "${files[@]}"; do
+    local id summary
+    id="$(basename "$f" .jsonl)"
+    SESSION_IDS+=("$id")
+    summary="$(timeout 10 python3 - "$f" <<'PY' 2>/dev/null
+import json, os, sys, datetime
+
+# The LAST human prompt, not the first: sessions in one project tend to open the
+# same way ("current obsidian vault path: ...") and are told apart by where they
+# ended up. Read only the file tail — transcripts reach 7.7 MB and nine of them
+# scanned in full would make the launcher feel broken.
+TAIL_BYTES = 400_000
+path = sys.argv[1]
+ts = text = ""
+try:
+    size = os.path.getsize(path)
+    with open(path, "rb") as fh:
+        if size > TAIL_BYTES:
+            fh.seek(size - TAIL_BYTES)
+            fh.readline()  # discard the partial line seek landed in
+        lines = fh.read().decode("utf-8", "replace").splitlines()
+    for line in reversed(lines):
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        if d.get("type") != "user":
+            continue
+        c = d.get("message", {}).get("content")
+        if isinstance(c, list):
+            c = " ".join(x.get("text", "") for x in c if isinstance(x, dict))
+        c = (c or "").strip()
+        # Drop tool results, injected context and slash-command plumbing —
+        # anything that is not something a person typed.
+        if (not c or c[0] in "<[" or c.startswith("Caveat:")
+                or c.startswith("Base directory for this skill:")):
+            continue
+        for marker in ("<system-reminder>", "<local-command", "UserPromptSubmit hook"):
+            c = c.split(marker)[0]
+        c = " ".join(c.split())
+        if c:
+            ts, text = d.get("timestamp", ""), c
+            break
+except OSError:
+    pass
+when = ""
+if ts:
+    try:
+        when = datetime.datetime.fromisoformat(
+            ts.replace("Z", "+00:00")).astimezone().strftime("%d %b %H:%M")
+    except ValueError:
+        when = ts[:16]
+print(f"{when}|{text[:64]}")
+PY
+)"
+    local when="${summary%%|*}" what="${summary#*|}"
+    printf "  ${PB}%d${R}  ${DIM}%-13s${R} %s\n" "$i" "${when:-?}" "${what:-(no prompt recorded)}"
+    i=$((i + 1))
+  done
+  return 0
+}
+
+main() {
+  clear 2>/dev/null || true
+  splash
+  preflight
+
+  cd "$PROJECT_DIR" || exit 1
+
+  # Non-interactive (piped, cron, CI): skip the prompt entirely and pass through.
+  if [[ ! -t 0 ]]; then
+    exec claude "$@"
+  fi
+
+  # Explicit arguments win — `second-brain --resume <id>` behaves like claude.
+  if [[ $# -gt 0 ]]; then
+    exec claude "$@"
+  fi
+
+  local have_sessions=0
+  if list_sessions; then
+    have_sessions=1
+    printf '\n'
+  fi
+
+  printf "  ${DIM}number to resume · ${R}u${DIM} to paste a session id · Enter for a fresh session${R}\n"
+  printf "  ${PB}>${R} "
+  local choice
+  read -r choice || choice=""
+
+  case "$choice" in
+    "")
+      exec claude
+      ;;
+    u|U)
+      printf "  ${DIM}session id:${R} "
+      local sid
+      read -r sid || sid=""
+      [[ -n "$sid" ]] || exec claude
+      exec claude --resume "$sid"
+      ;;
+    *[!0-9]*)
+      # Anything non-numeric is treated as a session id typed directly.
+      exec claude --resume "$choice"
+      ;;
+    *)
+      if [[ $have_sessions -eq 1 && "$choice" -ge 1 && "$choice" -le ${#SESSION_IDS[@]} ]]; then
+        exec claude --resume "${SESSION_IDS[$((choice - 1))]}"
+      fi
+      printf "  ${BAD}no session %s — starting fresh${R}\n" "$choice"
+      exec claude
+      ;;
+  esac
+}
+
+main "$@"

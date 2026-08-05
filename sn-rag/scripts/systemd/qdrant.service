@@ -1,0 +1,23 @@
+[Unit]
+Description=Qdrant vector database (sn-rag)
+Documentation=https://qdrant.tech/documentation/
+After=network.target
+
+[Service]
+Type=exec
+Environment=QDRANT__STORAGE__STORAGE_PATH=%h/.local/qdrant/storage
+Environment=QDRANT__STORAGE__SNAPSHOTS_PATH=%h/.local/qdrant/snapshots
+WorkingDirectory=%h/.local/qdrant
+ExecStart=%h/.local/qdrant/qdrant
+
+# The whole point of supervising this: an unsupervised Qdrant died mid-session
+# and every retrieval call failed until it was noticed by hand.
+Restart=always
+RestartSec=5s
+
+# Give indexing headroom but fail loudly rather than swapping the box to death.
+MemoryHigh=4G
+MemoryMax=8G
+
+[Install]
+WantedBy=default.target

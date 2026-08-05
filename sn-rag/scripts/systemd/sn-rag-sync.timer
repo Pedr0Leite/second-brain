@@ -1,0 +1,26 @@
+[Unit]
+Description=Nightly sn-rag corpus sync (catches up if the machine was off)
+
+[Timer]
+# Nightly at 03:00 local time.
+OnCalendar=*-*-* 03:00:00
+
+# THE CATCH-UP GUARANTEE.
+# Persistent=true makes systemd record the last time this timer fired. If the
+# machine was powered off (or suspended) at 03:00, systemd sees the missed
+# window on the next boot and triggers the unit then, instead of silently
+# skipping until tomorrow. This is precisely what plain cron does NOT do.
+Persistent=true
+
+# Wait a minute after boot so a catch-up run doesn't race Qdrant's startup.
+OnBootSec=2min
+
+# Spread the start over 15 minutes so a catch-up run doesn't land exactly when
+# the desktop is still loading.
+RandomizedDelaySec=15min
+
+# Timers only fire while the user session is alive; this survives it.
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

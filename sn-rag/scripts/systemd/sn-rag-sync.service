@@ -1,0 +1,20 @@
+[Unit]
+Description=sn-rag corpus sync and incremental reindex
+Documentation=file://%h/sn-rag/docs/BUILD-LOG.md
+# Do not fight the network coming up after a boot-time catch-up run.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Environment=CORPUS_PATH=... is supplied by the drop-in written by install.sh
+EnvironmentFile=%h/.config/sn-rag/sync.env
+ExecStart=/usr/bin/env bash %h/sn-rag/scripts/nightly_sync.sh
+# A reindex is long and low priority; never starve interactive work.
+Nice=10
+IOSchedulingClass=idle
+CPUSchedulingPolicy=batch
+TimeoutStartSec=6h
+
+[Install]
+WantedBy=default.target

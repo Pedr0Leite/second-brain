@@ -1,0 +1,75 @@
+# sn-rag — Qdrant only.
+#
+# WHY ONLY QDRANT
+# ---------------
+# The MCP server is deliberately NOT a service here. It speaks stdio and is
+# spawned per-session by Claude Code (`claude mcp add sn-rag -- python3 ...`),
+# so it has no port, no uptime and nothing to supervise. Wrapping it in a
+# container would mean bridging stdio across a container boundary to gain
+# nothing. Indexing is likewise a scheduled job, not a daemon — see
+# `sn-rag/scripts/systemd/sn-rag-sync.timer`.
+#
+# Qdrant is the only always-on component, and the only one that has actually
+# fallen over unsupervised (see docs/BUILD-LOG.md).
+#
+# WHEN TO USE THIS INSTEAD OF systemd
+# -----------------------------------
+# This file is the portable path for a machine that has Docker. The development
+# machine does not (ADR-0002: no Docker in this WSL distro, Qdrant runs from the
+# official static binary under a user systemd unit). Use one or the other, never
+# both — they would contend for port 6333 and, worse, for the same storage
+# directory.
+#
+#   docker compose up -d
+#   curl -s http://localhost:6333/collections
+#
+# Then point sn-rag at it if the host or port differ from the default:
+#   export QDRANT_URL=http://localhost:6333
+
+services:
+  qdrant:
+    # Pinned, not `latest`. The index on disk is written by a specific engine
+    # version; an unannounced major upgrade under a live collection is exactly
+    # the kind of silent breakage this project keeps finding.
+    image: qdrant/qdrant:v1.18.3
+    container_name: sn-rag-qdrant
+    restart: unless-stopped
+    ports:
+      # Bound to loopback on purpose. Qdrant has no authentication by default,
+      # and this corpus originates from a corporate tenant — a 0.0.0.0 bind
+      # would expose the whole knowledge base to anything on the network.
+      - "127.0.0.1:6333:6333"   # HTTP / REST
+      - "127.0.0.1:6334:6334"   # gRPC
+    volumes:
+      - qdrant_storage:/qdrant/storage
+      - qdrant_snapshots:/qdrant/snapshots
+    environment:
+      QDRANT__STORAGE__STORAGE_PATH: /qdrant/storage
+      QDRANT__STORAGE__SNAPSHOTS_PATH: /qdrant/snapshots
+      # Matches the systemd unit so behaviour does not diverge between the two
+      # deployment paths.
+      QDRANT__SERVICE__HTTP_PORT: 6333
+      QDRANT__SERVICE__GRPC_PORT: 6334
+    healthcheck:
+      # Qdrant's image has no shell utilities to rely on beyond this; the
+      # readiness endpoint is the supported check.
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/6333 && echo -e 'GET /readyz HTTP/1.1\\nHost: localhost\\nConnection: close\\n\\n' >&3 && grep -q '200 OK' <&3"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          # Mirrors MemoryMax in qdrant.service. Measured peak was 618 MB at
+          # 23k points, projecting to ~403 MB always-resident int8 for the full
+          # corpus, so 8G is headroom for indexing rather than steady state.
+          memory: 8G
+
+volumes:
+  # Named volumes, not bind mounts to the repo: the index is derived data and
+  # must never end up staged for commit alongside the corpus.
+  qdrant_storage:
+    name: sn_rag_qdrant_storage
+  qdrant_snapshots:
+    name: sn_rag_qdrant_snapshots

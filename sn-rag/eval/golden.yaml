@@ -1,0 +1,299 @@
+# Golden evaluation set — HUMAN-AUTHORED. Blocker #9.
+#
+# This is the single highest-leverage human contribution to the project. Without
+# it, "does retrieval work?" is unanswerable and every later phase is built on
+# an assumption. Target: >= 30 cases before the Phase 4 gate can be judged.
+#
+# Write questions you have ACTUALLY asked while working, in the words you would
+# actually use — not questions reverse-engineered from documents you already
+# know. Reverse-engineered questions inflate recall and teach you nothing.
+#
+# Schema
+# ------
+#   id:                  unique short slug
+#   question:            the query, phrased naturally
+#   profile:             general | servicenow | personal   (default: general)
+#                          servicenow -> official vendor docs only
+#                          personal   -> your notes/wiki/apps only
+#                          general    -> everything
+#   expected_rel_paths:  paths (relative to the corpus root) that SHOULD be
+#                        retrieved. ANY one of them counts as a hit, so list
+#                        genuine alternatives, not every loosely related file.
+#   notes:               optional; why this case matters, edge cases, etc.
+#
+# Paths are validated against the corpus before evaluation runs — a typo fails
+# loudly rather than silently scoring zero.
+#
+# PROVENANCE — read before trusting any number this produces.
+#
+# Cases tagged REAL in `notes` come from actual Claude Code session transcripts
+# (~/.claude/projects/**). Those are questions Pedro genuinely asked.
+#
+# Cases tagged CONSTRUCTED were written by Claude from ServiceNow practitioner
+# knowledge, in working language, BEFORE looking at any candidate document, then
+# matched to a document via filename/ripgrep search only. That ordering limits
+# vocabulary contamination but does NOT eliminate it. They are weaker evidence
+# than a question Pedro actually asked.
+#
+# Replacing CONSTRUCTED cases with real ones from your own work is the single
+# highest-value improvement available to this file.
+
+
+- id: subflow-action-instance
+  provenance: real
+  question: publishing a subflow fails saying at least one action instance is required
+  profile: personal
+  expected_rel_paths:
+  - wiki/concepts/flow-designer.md
+  notes: 'REAL: now-sdk build failure in session transcript. Profile corrected: expected
+    path is a personal note.'
+- id: global-scope-update-set
+  provenance: real
+  question: I have an update set open but want to build in global scope not a scoped
+    app
+  profile: personal
+  expected_rel_paths:
+  - wiki/concepts/scoped-apps.md
+  notes: 'REAL: session transcript. Profile corrected: expected path is a personal
+    note.'
+- id: graphify-into-vault
+  provenance: real
+  question: how do I get the graphify output indexed and embedded into the vault
+  profile: personal
+  expected_rel_paths:
+  - wiki/concepts/migrations.md
+  notes: 'REAL: session transcript, vault tooling question.'
+- id: business-rule-runs-twice
+  provenance: constructed
+  question: why does my business rule run twice when I insert a record
+  profile: servicenow
+  expected_rel_paths:
+  - ServiceNowOfficialDocs/build-workflows/business-rules-classic/c_BusinessRules.md
+  notes: CONSTRUCTED
+- id: before-after-async-br
+  provenance: constructed
+  question: before vs after vs async business rule when should I use which
+  profile: servicenow
+  expected_rel_paths:
+  - ServiceNowOfficialDocs/build-workflows/business-rules-classic/c_BusinessRules.md
+  notes: CONSTRUCTED
+- id: acl-table-vs-field
+  provenance: constructed
+  question: which ACL wins the table level one or the field level one
+  profile: servicenow
+  expected_rel_paths:
+  - ServiceNowOfficialDocs/platform-security/access-control/access-control-rules.md
+  - ServiceNowOfficialDocs/application-development/ACL-access-checks.md
+  notes: 'CONSTRUCTED LABEL CORRECTED after diagnosis: original expected path was
+    wrong/too narrow, not a retrieval failure.'
+- id: acl-read-denied
+  provenance: constructed
+  question: user cant see a field even though they have the role
+  profile: servicenow
+  expected_rel_paths:
+  - ServiceNowOfficialDocs/platform-security/access-control/access-control-rules.md
+  - ServiceNowOfficialDocs/platform-security/access-control/acl-advanced-config.md
+  notes: 'CONSTRUCTED LABEL CORRECTED after diagnosis: original expected path was
+    wrong/too narrow, not a retrieval failure.'
+- id: glideajax-async
+  provenance: constructed
+  question: my GlideAjax callback runs before the value comes back
+  profile: servicenow
+  expected_rel_paths:
+  - ServiceNowOfficialDocs/api-reference/c_GlideAjaxAPI.md
+  notes: CONSTRUCTED
+- id: glideajax-basic
+  provenance: constructed
+  question: call a script include from a client script
+  profile: servicenow
+  expected_rel_paths:
+  - ServiceNowOfficialDocs/api-reference/c_GlideAjaxAPI.md
+  notes: CONSTRUCTED
+- id: glideform-readonly
+  provenance: constructed
+  question: make a field read only from a client script
+  profile: servicenow
+  expected_rel_paths:
+  - ServiceNowOfficialDocs/api-reference/GlideFormAPINX.md
+  - ServiceNowOfficialDocs/api-reference/c_GlideFormAPI.md
+  notes: 'CONSTRUCTED LABEL CORRECTED after diagnosis: original expected path was
+    wrong/too narrow, not a retrieval failure.'
+- id: glideform-dropdown
+  provenance: constructed
+  question: add a choice to a dropdown field from a client script
+  profile: servicenow
+  expected_rel_paths:
+  - ServiceNowOfficialDocs/api-reference/GlideFormAPINX.md
+  - ServiceNowOfficialDocs/api-reference/c_GlideFormAPI.md
+  notes: 'CONSTRUCTED LABEL CORRECTED after diagnosis: original expected path was
+    wrong/too narrow, not a retrieval failure.'
+- id: glideuser-roles
+  provenance: constructed
+  question: check the current users roles on the client side
+  profile: servicenow
+  expected_rel_paths:
+  - ServiceNowOfficialDocs/api-reference/c_GlideUserAPI.md
+  notes: CONSTRUCTED
+- id: gliderecord-client
+  provenance: constructed
+  question: query records from a client script without a script include
+  profile: servicenow
+  expected_rel_paths:
+  - ServiceNowOfficialDocs/api-reference/c_GlideRecordClientSideAPI.md
+  notes: CONSTRUCTED
+- id: accept-live-chat
+  provenance: constructed
+  question: how does an agent accept an incoming live chat and get an incident created
+  profile: servicenow
+  expected_rel_paths:
+  - ServiceNowOfficialDocs/it-service-management/accept-chat-ai-native-itsm.md
+  notes: CONSTRUCTED
+- id: va-hidden-variables
+  provenance: constructed
+  question: what are the undocumented virtual agent variables like vaVars and vaContext
+  profile: personal
+  expected_rel_paths:
+  - Notion/ServiceNow/AI & VA/50+ (Un)documented Virtual Agent variables (vaInpu 1f6c42ce9a56808d8943f42feeb822c6.md
+  notes: CONSTRUCTED. Personal Notion note; official docs cover only a few of these.
+- id: now-assist-skill-kit
+  provenance: constructed
+  question: my notes on building a custom skill with now assist skill kit
+  profile: personal
+  expected_rel_paths:
+  - Notion/ServiceNow/AI & VA/Build Custom AI Skills with Now Assist Skill Kit S 230c42ce9a56803da362e504d329bfb7.md
+  notes: CONSTRUCTED
+- id: glidedatetime-gotchas
+  provenance: constructed
+  question: gotchas with GlideDateTime and timezones
+  profile: personal
+  expected_rel_paths:
+  - Notion/ServiceNow/Server and Client Side Scripts/The Secrets of GlideDateTime
+    357c42ce9a5680cfa38af0eb8bda8159.md
+  notes: CONSTRUCTED
+- id: impersonate-via-script
+  provenance: constructed
+  question: impersonate a user from a background script
+  profile: personal
+  expected_rel_paths:
+  - Notion/ServiceNow/Server and Client Side Scripts/Impersonate a user via script
+    313c42ce9a5680828be3f959f6cb18d9.md
+  notes: CONSTRUCTED
+- id: my-acl-notes
+  provenance: constructed
+  question: what are my own notes on how ACLs evaluate
+  profile: personal
+  expected_rel_paths:
+  - wiki/concepts/acls.md
+  notes: CONSTRUCTED. Tests that 391 personal files are not buried under 51k official
+    docs.
+- id: gliderecord-patterns-notes
+  provenance: constructed
+  question: my notes on efficient GlideRecord patterns
+  profile: personal
+  expected_rel_paths:
+  - wiki/concepts/gliderecord-patterns.md
+  notes: CONSTRUCTED
+- id: server-client-notes
+  provenance: constructed
+  question: my notes on server side vs client side scripting
+  profile: personal
+  expected_rel_paths:
+  - wiki/concepts/server-client-scripts.md
+  notes: CONSTRUCTED
+- id: service-portal-notes
+  provenance: constructed
+  question: my service portal notes
+  profile: personal
+  expected_rel_paths:
+  - wiki/concepts/service-portal.md
+  notes: CONSTRUCTED
+- id: mid-server-notes
+  provenance: constructed
+  question: my notes about the mid server
+  profile: personal
+  expected_rel_paths:
+  - wiki/concepts/mid-server.md
+  notes: CONSTRUCTED
+- id: cmdb-notes
+  provenance: constructed
+  question: my notes on the cmdb
+  profile: personal
+  expected_rel_paths:
+  - wiki/concepts/cmdb.md
+  notes: CONSTRUCTED
+- id: acls-general
+  provenance: constructed
+  question: how do ACLs work
+  profile: general
+  expected_rel_paths:
+  - ServiceNowOfficialDocs/platform-security/access-control/access-control-rules.md
+  - wiki/concepts/acls.md
+  notes: 'CONSTRUCTED. Same topic as my-acl-notes but unscoped; compares agent behaviour.
+    LABEL CORRECTED after diagnosis: original expected path was wrong/too narrow,
+    not a retrieval failure.'
+- id: neg-licence-cost
+  provenance: negative
+  question: what does a ServiceNow ITOM licence cost per node
+  profile: servicenow
+  expected_rel_paths: []
+  notes: NEGATIVE. Pricing is not in the docs corpus. Fabricating a number here is
+    a build failure.
+  expect_no_answer: true
+- id: neg-unit4-approval
+  provenance: negative
+  question: what is our internal Unit4 approval process for production changes
+  profile: general
+  expected_rel_paths: []
+  notes: NEGATIVE. Company-internal process, deliberately not in this corpus.
+  expect_no_answer: true
+- id: neg-account-manager
+  provenance: negative
+  question: who is our ServiceNow account manager and what is their email
+  profile: general
+  expected_rel_paths: []
+  notes: NEGATIVE. No such record exists; tests that the agent does not invent people.
+  expect_no_answer: true
+- id: neg-competitor
+  provenance: negative
+  question: how do I configure a Jira automation rule to sync with Zendesk
+  profile: general
+  expected_rel_paths: []
+  notes: NEGATIVE. Out of domain entirely.
+  expect_no_answer: true
+- id: neg-future-release
+  provenance: negative
+  question: what are the new features in the Brisbane release
+  profile: servicenow
+  expected_rel_paths: []
+  notes: NEGATIVE. No such release exists in this corpus (latest is Australia). Tests
+    plausible-sounding but unanswerable.
+  expect_no_answer: true
+- id: general-business-rule
+  provenance: constructed
+  question: how do business rules work
+  profile: general
+  expected_rel_paths:
+  - ServiceNowOfficialDocs/build-workflows/business-rules-classic/c_BusinessRules.md
+  notes: CONSTRUCTED. Generic official-topic question; official doc should win unscoped.
+- id: general-glideajax
+  provenance: constructed
+  question: how do I use GlideAjax
+  profile: general
+  expected_rel_paths:
+  - ServiceNowOfficialDocs/api-reference/c_GlideAjaxAPI.md
+  notes: CONSTRUCTED
+- id: general-acl-checks
+  provenance: constructed
+  question: how does ServiceNow check access to a record
+  profile: general
+  expected_rel_paths:
+  - ServiceNowOfficialDocs/platform-security/access-control/access-control-rules.md
+  notes: 'CONSTRUCTED LABEL CORRECTED after diagnosis: original expected path was
+    wrong/too narrow, not a retrieval failure.'
+- id: general-va-variables
+  provenance: constructed
+  question: undocumented virtual agent variables vaVars vaContext
+  profile: general
+  expected_rel_paths:
+  - Notion/ServiceNow/AI & VA/50+ (Un)documented Virtual Agent variables (vaInpu 1f6c42ce9a56808d8943f42feeb822c6.md
+  notes: CONSTRUCTED. Specific enough that the personal note should win even unscoped.
