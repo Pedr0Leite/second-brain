@@ -158,7 +158,60 @@ PY
   return 0
 }
 
+usage() {
+  splash
+  cat <<'USAGE'
+  Launcher for the second brain: preflight checks, then a Claude Code session.
+
+  USAGE
+    second-brain                 splash, health checks, then pick a session
+    second-brain --resume <id>   resume directly (any claude flag passes through)
+    second-brain --status        health checks only, then exit — no session
+    second-brain --sessions      list recent sessions and exit
+    second-brain --help          this text
+
+  SESSION PICKER
+    <number>   resume that session
+    u          paste a session id
+    <id>       type/paste an id directly
+    Enter      fresh session
+
+  HEALTH LINE
+    qdrant     vector store on :6333. Down means EVERY search fails.
+    planner    ollama on :11434. Down means only sn_research fails
+               (structured PLANNER_UNAVAILABLE — never a paid fallback).
+    indexing   shown only while an embed job is running. The index is
+               incomplete during it, so recall is a lower bound.
+
+  NOTES
+    Nothing needs starting by hand. Qdrant is a systemd user service and the
+    MCP server is spawned per session by Claude Code. NO_COLOR is honoured.
+
+  MORE
+    sn-rag/README.md          install, MCP tools, commands, troubleshooting
+    sn-rag/docs/adr/          why things are the way they are
+USAGE
+}
+
 main() {
+  # Parse our own flags BEFORE anything else — --help must not require a TTY,
+  # clear the screen, or wait on service checks.
+  case "${1:-}" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --status)
+      splash
+      preflight
+      exit 0
+      ;;
+    --sessions)
+      list_sessions || printf "  no sessions recorded for this project\n"
+      exit 0
+      ;;
+  esac
+
   clear 2>/dev/null || true
   splash
   preflight

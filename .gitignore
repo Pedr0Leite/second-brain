@@ -1,0 +1,37 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+
+# Runtime state — regenerable, and large.
+# The manifest is a ~600 MB SQLite database rebuilt by `index.py full`; it is
+# derived data, not source. Its backups are the same thing with a suffix.
+*.db
+*.db-wal
+*.db-shm
+*.mntc-backup
+manifest.db*
+
+# Logs (embed runs, nightly sync)
+*.log
+full-embed.log
+
+# Model cache, if anyone points MODEL_CACHE_PATH inside the repo
+.cache/
+fastembed_cache/
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Secrets — nothing here today, and nothing here ever.
+.env
+.env.*
+*.pem
+*.key
+*_rsa

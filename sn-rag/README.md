@@ -1,427 +1,848 @@
+```
+      _---~~(~~-_.
+    _{        )   )
+  ,   ) -~~- ( ,-' )_
+ (  `-,_..`., )-- '_,)
+( ` _)  (  -~( -_ `,  }
+(_-  _  ~_-~~~~`,  ,' )
+  `~ -^(    __;-,((()))
+        ~~~~ {_ -_(())
+               `\  }
+                 { }
+
+        S E C O N D   B R A I N
+```
+
 # sn-rag
 
-Local agentic RAG over a ~51,600-file markdown corpus (ServiceNow documentation +
-personal second brain), exposed to Claude Code over MCP.
+Local agentic RAG over ~51,600 markdown files — the ServiceNow documentation
+corpus plus a personal second brain — exposed to Claude Code over MCP.
 
-**Retrieval runs on free local models; Claude only sees a compressed, cited brief.**
-That boundary is the point: it replaces an `INDEX.md` + grep + read-whole-file
-workflow that burned tokens finding one paragraph, and it takes the 51k-file corpus
-out of Obsidian, which was crashing under it.
+It replaces an `INDEX.md` + grep + read-whole-file workflow that burned tokens
+finding one paragraph, and it takes the 51k-file corpus out of Obsidian, which
+was crashing under it.
 
-Measured against that old workflow on 29 questions: **78.5x fewer tokens, and 8.4x
-more likely to surface the right document** (0.862 vs 0.103 hit rate). See the
-caveats on those numbers under [Status](#status) — the hit rate is provisional.
+Measured against that old workflow on 29 questions: **78.5× fewer tokens**
+(3,040,367 → 38,713) and **8.4× more likely to surface the right document**
+(0.862 vs 0.103 hit rate). The hit rate is provisional — see [Status](#status).
 
-Generic by design — ServiceNow is the first corpus profile, not a hard-coded
-assumption (see `docs/adr/0001`).
+Generic by design: ServiceNow is the first corpus profile, not a hard-coded
+assumption (ADR-0001).
+
+**The one rule: retrieval never calls a paid model.** Embedding, hybrid search,
+reranking, query planning and evidence selection all run on free local models on
+this CPU. Claude only ever sees a small, capped, cited brief.
+
+Two consequences follow, and they explain most of the design:
+
+- **Claude synthesizes; the local model only plans and selects.** A 3B model at
+  20.7 tok/s would need ~58 s to write a 900-word answer against a 15 s budget.
+  It emits short structured JSON instead (ADR-0004).
+- **Failure is explicit, never a fallback.** No local planner means
+  `PLANNER_UNAVAILABLE`. There is no hosted route to fail over to, by design — a
+  silent fallback would destroy the point while making every metric look good.
 
 ---
 
-## How it works
+## Contents
+
+- [Architecture](#architecture) · [Do I need Obsidian?](#do-i-need-obsidian)
+- [Requirements](#requirements) · [Install](#install) · [Build the index](#build-the-index)
+- [Daily use](#daily-use) · [MCP tool reference](#mcp-tool-reference)
+- [Command reference](#command-reference)
+- [Keeping it current](#keeping-it-current) · [Install on a local server](#install-on-a-local-server)
+- [Configuration](#configuration) · [Troubleshooting](#troubleshooting)
+- [Testing and evaluation](#testing-and-evaluation) · [Status](#status) · [Layout](#layout)
+
+---
+
+## Architecture
 
 ```mermaid
 flowchart TB
-    subgraph you["You"]
-        OBS["Obsidian<br/><i>authoring only — never required</i>"]
-        CC["Claude Code"]
+    subgraph vault["Obsidian vault — plain markdown on disk"]
+        V["~/vaults/obsidian-servicenow-docs<br/>51,642 files · 5.2 GB<br/>git repo, synced nightly"]
     end
 
-    VAULT[("Vault — markdown files<br/>/home/pedro/vaults/obsidian-servicenow-docs<br/>51,642 files on ext4")]
-
-    subgraph ingest["Ingest (batch, offline)"]
-        WALK["walk + sha256<br/><i>content hash decides staleness</i>"]
-        CHUNK["chunker (pure)<br/>parents 2–4k chars<br/>children 500/100<br/><i>code fences + tables atomic</i>"]
-        EMB["embed<br/>bge-base dense + BM25 sparse<br/><i>length-sorted, 6 threads</i>"]
+    subgraph ingest["Ingest — runs offline, never during a query"]
+        W["walk + classify<br/>source from top-level dir<br/>skips .git / .obsidian / index.md"]
+        C["chunk hierarchically<br/>parent 2-4k chars = context<br/>child 500 chars = search unit<br/>code fences + tables ATOMIC"]
+        E["embed<br/>bge-base-en-v1.5 768d dense<br/>+ BM25 sparse<br/>length-sorted batches of 32"]
+        W --> C --> E
     end
 
-    MAN[("manifest.db (SQLite)<br/>files · chunks · parents<br/><i>on ext4</i>")]
-    QD[("Qdrant :6333<br/>dense + sparse vectors<br/>int8, on-disk")]
-
-    subgraph mcp["MCP server (stdio, per session)"]
-        TOOLS["7 tools"]
-        CAPSM["caps.py<br/><i>output limits enforced in code</i>"]
+    subgraph store["Storage"]
+        Q[("Qdrant :6333<br/>collection 'knowledge'<br/>int8 quantized, on-disk")]
+        M[("SQLite manifest<br/>sha256 per file<br/>parents · chunks · status")]
     end
 
-    subgraph ret["Retrieval"]
-        HYB["hybrid search<br/>dense + BM25 → RRF"]
-        RR["cross-encoder rerank<br/>50 candidates → top k"]
-        LEX["ripgrep<br/><i>exact symbols</i>"]
-        PROF["agents: general / servicenow / personal"]
+    subgraph retrieval["Retrieval — per query"]
+        H["hybrid search<br/>dense + BM25, RRF fused"]
+        RR["cross-encoder rerank<br/>50 candidates to top 8"]
+        LX["ripgrep<br/>exact API symbols"]
+        PR["agent profiles<br/>general · servicenow · personal"]
     end
 
-    subgraph agent["Agent loop (Phase 5)"]
-        PLAN["planner — qwen2.5:3b local<br/><i>plans + selects, never writes prose</i>"]
+    subgraph agent["Agent loop — Phase 5"]
+        PL["local planner<br/>qwen2.5:3b via Ollama<br/>JSON only, never prose"]
+        JU["relevance judge<br/>yes/no, 4 tokens max"]
+        PL --> JU
     end
 
-    OBS -.edits.-> VAULT
-    VAULT --> WALK --> CHUNK --> EMB
-    EMB -- "upsert BEFORE commit" --> QD
-    EMB --> MAN
-    CHUNK --> MAN
+    subgraph mcp["MCP server — stdio, spawned per session"]
+        T["sn_search · sn_get_section · sn_outline<br/>sn_lexical · sn_research · sn_stats · sn_ingest"]
+        CAP["caps enforced IN CODE<br/>never as prompt instructions"]
+        T --> CAP
+    end
 
-    CC <-->|"stdio"| TOOLS
-    TOOLS --> CAPSM
-    TOOLS --> PROF
-    PROF --> HYB --> RR
-    PROF --> LEX
-    HYB <--> QD
-    RR --> TOOLS
-    LEX --> VAULT
-    TOOLS -->|"sn_get_section / sn_outline"| MAN
-    TOOLS -->|"sn_research"| PLAN
-    PLAN --> PROF
-    TOOLS -->|"sn_ingest writes"| VAULT
+    CL(["Claude Code<br/>synthesis + citations"])
 
-    TIMER["systemd timer 03:07<br/><i>Persistent=true — catches up a missed run</i>"] --> WALK
+    V --> W
+    E -->|"1. upsert vectors"| Q
+    E -->|"2. THEN commit manifest<br/>order is the crash-safety"| M
+    Q --> H --> RR --> T
+    V -.-> LX --> T
+    M --> T
+    PR --> H
+    RR --> JU
+    JU --> T
+    CAP --> CL
+    CL -.->|"sn_ingest: the only writer"| V
 
-    classDef store fill:#1f2937,stroke:#4b5563,color:#e5e7eb
-    class VAULT,MAN,QD store
+    TIMER{{"systemd timer 03:00<br/>Persistent=true catches up<br/>runs missed during downtime"}}
+    TIMER -.-> W
 ```
 
-**The one rule that shapes everything:** retrieval must never call a paid model. If
-the local planner is unreachable, `sn_research` returns `PLANNER_UNAVAILABLE` —
-there is deliberately no fallback. A silent failover would make every metric improve
-while destroying the reason the project exists.
+**Why steps 1 and 2 are numbered.** Vectors are upserted to Qdrant *before* the
+manifest is committed. Reversed, a crash leaves files marked indexed with no
+vectors — a silent recall hole. Surplus vectors self-heal on the next run;
+missing ones never do. This was tested by an unplanned reboot mid-index: zero
+drift, `match = True`.
 
-Two consequences worth knowing:
+### Retrieval flow for one question
 
-- **Claude synthesizes, the local model doesn't.** At the measured 20.7 tok/s, a
-  900-word local answer costs ~58s against a 15s budget. So the 3B model only plans
-  queries and judges relevance (tens of tokens); writing the answer is Claude's job.
-  See `docs/adr/0004`.
-- **Upsert to Qdrant happens *before* the manifest commit.** The reverse order
-  leaves files marked indexed with no vectors — a silent recall hole. Surplus
-  vectors self-heal; missing ones don't.
+```
+question
+   ├─ planner decomposes → 2-3 sub-queries + agent profile     (~2 s, local)
+   ├─ per sub-query: dense + BM25 → RRF fuse → 50 candidates   (~0.9 s)
+   ├─ cross-encoder reranks 50 → top 8                          (~0.5 s)
+   ├─ dedupe by parent_id, pool = 3× budget
+   ├─ judge each candidate from rank 3 down: relevant? yes/no  (≤4 tok each)
+   └─ cap in code → ≤900 words, ≤6 items, ≤6000 chars → Claude
+```
+
+Why parent/child chunking: small chunks search precisely, large chunks read
+usefully. You search 500-char children and read 2-4k-char parents.
 
 ---
 
 ## Do I need Obsidian?
 
-**No.** sn-rag reads markdown files off disk and nothing else — it never touches
-Obsidian, its cache, or `.obsidian/` (excluded outright). Obsidian is just a human
-authoring tool for the same folder.
+**No.** Nothing here talks to Obsidian. The corpus is plain markdown files in a
+directory; Obsidian is just one editor that happens to read them.
 
-That is the entire point of the split: retrieval and authoring no longer share a
-process. **All sn-rag needs is the folder of files, kept current.**
-
-The corpus lives on ext4 rather than a Windows mount because lexical search measured
-**342x faster** there (25.7s → 0.075s over 51,642 files). Obsidian reaches it via
-`\\wsl$\<distro>\home\pedro\vaults\obsidian-servicenow-docs`.
-
----
-
-## What actually runs
-
-| component | what it is | lifetime |
-|---|---|---|
-| Qdrant | vector database, :6333 | always on — `qdrant.service` (`Restart=always`) or `docker-compose.yml` |
-| nightly sync | detects changed files, embeds the delta | timer 03:07; `Persistent=true` catches up a missed run |
-| MCP server | the 7 tools Claude Code calls | spawned per session over stdio, exits with the session |
-
-No always-on Python process.
-
----
-
-## The MCP surface — all 7 tools
-
-You never call these directly. You ask Claude a question; it picks the tool. This
-table is here so you know what it *can* do, and so you can ask for a specific tool
-when you want one.
-
-Every tool returns `{ok: true, ...}` with citations, or
-`{ok: false, error_code, message, retryable}`. Never prose, never an empty success.
-
-### `sn_search` — the default entry point
-```
-sn_search(query, agent="general", k=8, release=None, product=None, doc_type=None)
-```
-Hybrid dense+BM25 retrieval, RRF-fused, cross-encoder reranked (50 candidates → k).
-Returns ranked snippets with `parent_id` for follow-up.
-**Cap: 8 results, 150 words each, 6,000 chars total.**
-
-Code-like queries (`GlideRecord`, `sys_user_grmember`, `gs.info()`) additionally
-route through ripgrep and promote exact matches.
-
-### `sn_get_section` — expand one result
-```
-sn_get_section(parent_id)
-```
-Returns one parent section verbatim, from the manifest. Use the `parent_id` from a
-`sn_search` hit when the snippet isn't enough. **Cap: 8,000 chars.**
-
-### `sn_outline` — a document's shape
-```
-sn_outline(rel_path)
-```
-Header tree only, no body text. Cheap way to decide whether a document is worth
-opening. **Cap: 3,000 chars.**
-
-### `sn_lexical` — exact symbols
-```
-sn_lexical(pattern, agent="general", fixed_string=True)
-```
-ripgrep over the corpus. Use when you need an exact identifier, not semantic
-similarity — dense retrieval smears `addEncodedQuery` into "query-ish" neighbours.
-**Cap: 20 hits, 4,000 chars.**
-
-### `sn_research` — the agent loop
-```
-sn_research(question, agent="general", budget=6)
-```
-Local planner decomposes the question into 1–3 queries, retrieves, judges candidates
-for relevance, and returns **selected cited evidence plus a reasoning trace** — not a
-written answer. Returns `PLANNER_UNAVAILABLE` if Ollama is down.
-**Cap: 900 words total across ≤6 items.**
-
-### `sn_stats` — index health
-```
-sn_stats()
-```
-Document/chunk counts, sources, and manifest-vs-Qdrant drift. **Cap: 500 chars.**
-
-### `sn_ingest` — the only tool that writes
-```
-sn_ingest(source_path=None, content=None, filename=None, dest=None,
-          source_class="personal", overwrite=False)
-```
-Saves a document into the vault, then chunks, embeds and upserts it **within the same
-call** (~1.5s), so it is searchable before the call returns. Pass either
-`source_path` or `content`, not both.
-
-Security boundary — an LLM-invokable file write is a real hazard, so every one of
-these is refused with a structured error: absolute paths, `..` traversal, symlink
-escapes, null bytes, non-markdown extensions, overwriting without `overwrite=true`,
-and writing into the `official` vendor corpus. It never deletes.
-
-### The three agents
-
-| agent | searches | use for |
-|---|---|---|
-| `general` | everything | when you're not sure |
-| `servicenow` | official vendor docs only | platform/API questions |
-| `personal` | your notes, wiki, apps, code graphs | "what did I write about X" |
-
-An unknown agent name is a `BAD_REQUEST`, never a silent fallback to `general`.
-
----
-
-## Step by step: using it
-
-### 1. One-time setup
-
-```bash
-# Qdrant, supervised (systemd — no Docker needed)
-cp scripts/systemd/qdrant.service ~/.config/systemd/user/
-systemctl --user daemon-reload && systemctl --user enable --now qdrant.service
-
-# ripgrep, for sn_lexical
-sudo apt install ripgrep    # or: cargo install ripgrep
-
-# local planner for sn_research (optional — everything else works without it)
-ollama pull qwen2.5:3b-instruct
-
-# register with Claude Code
-claude mcp add sn-rag \
-  -e CORPUS_PATH=/home/pedro/vaults/obsidian-servicenow-docs \
-  -e MANIFEST_DB_PATH=/home/pedro/.local/state/sn-rag/manifest.db \
-  -- python3 "$PWD/mcp_server/server.py"
-
-claude mcp list      # expect: sn-rag ... ✔ Connected
-
-# nightly sync with missed-run catch-up
-SN_RAG_DIR=$PWD CORPUS_PATH=/home/pedro/vaults/obsidian-servicenow-docs \
-  bash scripts/systemd/install.sh
-```
-
-### 2. Build the index (first run only)
-
-```bash
-python3 ingest/index.py full      # walk, hash, classify — no ML, fast
-python3 ingest/index.py verify    # manifest vs filesystem
-
-# Start small. The gate exists to catch problems before a multi-hour run.
-python3 ingest/index.py embed --limit 500 --shuffle
-python3 ingest/index.py status    # expect: match = True
-
-# Then the rest. ~14 chunks/s on 6 threads → plan on overnight for a full corpus.
-setsid nohup env PYTHONUNBUFFERED=1 python3 ingest/index.py embed \
-  > ~/.local/state/sn-rag/full-embed.log 2>&1 &
-tail -f ~/.local/state/sn-rag/full-embed.log
-```
-
-`--shuffle` matters: an alphabetical prefix of this corpus is almost entirely one
-product area, so evaluating a partial alphabetical index is misleading.
-
-The embed is **resumable** — kill it any time, it picks up from the manifest.
-
-### 3. Daily use
-
-Just talk to Claude. It picks the tool.
-
-> "how does GlideAggregate groupBy work"
-> → `sn_search` with `agent="servicenow"`
-
-> "what did I write about ACL debugging"
-> → `sn_search` with `agent="personal"`
-
-> "find every use of sys_user_grmember"
-> → `sn_lexical`
-
-> "save this as a note on flow designer gotchas"
-> → `sn_ingest` — written, embedded and searchable before the call returns
-
-To force a specific tool, just name it: *"use sn_lexical to find addEncodedQuery"*.
-
-### 4. Keeping it current
-
-Write in Obsidian, save, go to bed — the 03:07 timer picks up changes by content
-hash. If the machine was off, `Persistent=true` runs it at next boot.
-
-Manual, when impatient:
-
-```bash
-python3 ingest/index.py full && python3 ingest/index.py embed
-```
-
-Both share `~/.local/state/sn-rag/sync.lock`, so a manual run during the nightly
-sync waits rather than corrupting anything.
-
-### 5. When something looks wrong
-
-```bash
-systemctl --user is-active qdrant.service   # check this before blaming retrieval
-python3 ingest/index.py status              # expect match = True
-python3 -m pytest tests/ -q                 # 128 tests, zero skips
-journalctl --user -u sn-rag-sync.service -n 50
-```
-
-`status` reporting `match = False` means the manifest and Qdrant disagree — usually
-an interrupted run. Re-running `embed` reconciles it.
-
----
-
-## Status
-
-| phase | state |
+| you want to | Obsidian required? |
 |---|---|
-| 0 · Recon & baseline | done — 78.5x token reduction measured |
-| 1 · Normalizer + manifest | done — 51,642 files, exact reconciliation |
-| 2 · Chunker | done — 63 tests, pure functions |
-| 3 · Embedding + index | done; full-corpus embed in progress |
-| 4 · Retrieval + eval | built; **gate INCONCLUSIVE** — needs real golden cases |
-| 5 · Agent loop | done — local planner, plan/retrieve/select/cite |
-| 6 · MCP server | done — 7 tools, registered and connected |
-| 7 · Incremental sync | done — corpus on ext4, timer with catch-up |
+| search / read the corpus from Claude | no |
+| index new or changed files | no |
+| have Claude write a note into the vault | no |
+| edit notes yourself with backlinks and graph view | yes — that's what it's for |
 
-**The remaining blocker is human-only.** `eval/golden.yaml` has 34 cases but only
-**3 with `provenance: real`** — questions asked before the answer was known. The
-other 26 were written while reading the documents they retrieve, which inflates
-recall: they score **1.000** on the `personal` profile, and a perfect score is what
-circularity looks like from outside.
-
-`run_eval.py` therefore scores the gate on real cases only and exits **2 =
-INCONCLUSIVE** below 20 of them — neither pass nor fail. Every recall figure here,
-including the 0.862 above, is provisional until ~20 real questions replace them.
-See `docs/GOLDEN-SET-GUIDE.md`.
+Obsidian and sn-rag touch the same folder independently. Edit in Obsidian, in
+`vim`, or via `sn_ingest` — the nightly sync notices whatever changed by content
+hash and reindexes only that.
 
 ---
 
 ## Requirements
 
-- Python 3.12+ (3.14 verified)
-- `fastembed`, `qdrant-client`, `pyyaml`, `pytest`
-- Qdrant — native binary or `docker-compose.yml` (see `docs/adr/0002`)
-- `ripgrep` for `sn_lexical`
-- Ollama + `qwen2.5:3b-instruct` for `sn_research` only
+### Hardware
 
-```bash
-pip install --user fastembed qdrant-client pyyaml pytest
-```
+| | minimum | this build |
+|---|---|---|
+| CPU | 4 cores | AMD Ryzen 5 9600X, 6c/12t |
+| RAM | 8 GB (tight) · **16 GB recommended** | 25 GB |
+| disk | 25 GB free | — |
+| GPU | none — **everything is CPU-only** | none (`nvidia-smi` absent) |
 
-CPU-only is fine and is what this was tuned on. No GPU required.
+Disk: corpus 5.2 GB · Qdrant ~3.4 GB at full index · manifest ~600 MB · models
+~300 MB · Ollama planner 1.9 GB.
+
+**Filesystem matters more than it looks.** The corpus must live on a native Linux
+filesystem. Measured on the same files: lexical search took **25.689 s** on a
+Windows 9p mount (`/mnt/c`) versus **0.075 s** on ext4 — **342×**. SQLite commits
+on the manifest were 24× slower. Both now live under `$HOME`.
+
+### Software
+
+| component | version here | notes |
+|---|---|---|
+| Python | 3.14.4 | 3.11+ expected to work; not tested below 3.14 |
+| Qdrant | 1.18.3 | official static binary, not Docker (ADR-0002) |
+| Ollama | 0.32.5 | only for `sn_research`; everything else works without it |
+| ripgrep | 14.1.1 | required by `sn_lexical`; its absence once caused 51 silent test skips |
+| git | any | the corpus is a git repo, synced nightly |
+
+Python packages live in `requirements.txt`: **fastembed 0.8.0**, **qdrant-client
+1.18.0**, **mcp 2.0.0**, **PyYAML 6.0.3**, plus pytest for the suite.
+
+The planner talks to Ollama over stdlib `urllib`. The `openai` SDK is
+deliberately **not** a dependency — an SDK whose default base URL is a paid
+endpoint is exactly the accident this project exists to prevent.
+
+### Models — all free, all local, ~300 MB total
+
+| role | model | why |
+|---|---|---|
+| dense | `BAAI/bge-base-en-v1.5` (768d) | bge-small was only 1.5× faster, not the 3× that would justify halving dimensions |
+| sparse | `Qdrant/bm25` | exact term matching for API symbols |
+| rerank | `Xenova/ms-marco-MiniLM-L-6-v2` | 50 candidates → top 8 |
+| planner | `qwen2.5:3b-instruct` | JSON only; ~20.7 tok/s on this CPU |
 
 ---
 
-## Commands
+## Install
 
-| command | purpose |
+### 1. Python packages
+
+```bash
+cd sn-rag
+pip install --user --break-system-packages -r requirements.txt
+```
+
+Prefer a virtualenv where your machine supports it (`python3 -m venv` fails on
+this box — `ensurepip` is unavailable, which is why the `--user` form is
+documented first).
+
+### 2. ripgrep
+
+```bash
+sudo apt install ripgrep        # or: brew install ripgrep
+rg --version                    # must print — sn_lexical is dead without it
+```
+
+### 3. Qdrant
+
+```bash
+mkdir -p ~/.local/qdrant && cd ~/.local/qdrant
+curl -L -o qdrant.tar.gz \
+  https://github.com/qdrant/qdrant/releases/download/v1.18.3/qdrant-x86_64-unknown-linux-musl.tar.gz
+tar xzf qdrant.tar.gz && chmod +x qdrant
+./qdrant --version              # qdrant 1.18.3
+```
+
+Run it under systemd so it survives reboots:
+
+```bash
+cp scripts/systemd/qdrant.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now qdrant.service
+systemctl --user is-active qdrant.service      # active
+```
+
+> **Qdrant ships with no authentication.** It binds `127.0.0.1` here, and that is
+> the only reason it is safe. Do not move it to a LAN address without setting
+> `QDRANT__SERVICE__API_KEY` — see [Install on a local server](#install-on-a-local-server).
+
+### 4. The corpus
+
+```bash
+git clone <your-vault-repo> ~/vaults/obsidian-servicenow-docs
+```
+
+Every top-level directory containing `.md` files must be classified in
+`SOURCE_BY_TOP_DIR` in `config.py`, or ingest **fails loudly** rather than
+silently skipping files. Add yours there.
+
+### 5. Ollama — optional, only for `sn_research`
+
+```bash
+curl -fsSL https://ollama.com/install.sh | sh
+ollama pull qwen2.5:3b-instruct
+curl -s localhost:11434/api/tags     # should list the model
+```
+
+Skip this and everything except `sn_research` works normally.
+
+### 6. Register the MCP server with Claude Code
+
+Run from the **project directory** you want it available in — scope follows cwd:
+
+```bash
+cd /path/to/second-brain
+claude mcp add sn-rag \
+  --env CORPUS_PATH=$HOME/vaults/obsidian-servicenow-docs \
+  --env MANIFEST_DB_PATH=$HOME/.local/state/sn-rag/manifest.db \
+  -- python3 /full/path/to/sn-rag/mcp_server/server.py
+```
+
+Add `--scope user` to make it available in every project.
+
+### 7. Verify
+
+```bash
+python3 -c "import config; print(config.CORPUS_PATH, config.MANIFEST_DB_PATH)"
+python3 -m pytest tests/ -q          # 129 passed
+```
+
+---
+
+## Build the index
+
+**Always sample first.** Full indexing takes hours; a broken chunker discovered
+at hour six is expensive.
+
+```bash
+python3 ingest/index.py full --limit 500 --shuffle    # sample gate
+python3 ingest/index.py status                        # must report match = True
+```
+
+`--shuffle` is not cosmetic: an alphabetical prefix of this corpus is almost
+entirely one product area, so evaluating against it is misleading.
+
+Then the full run, detached so a closed terminal cannot kill it:
+
+```bash
+mkdir -p ~/.local/state/sn-rag
+setsid nohup python3 ingest/index.py embed --shuffle \
+  >> ~/.local/state/sn-rag/full-embed.log 2>&1 < /dev/null &
+tail -f ~/.local/state/sn-rag/full-embed.log
+```
+
+**Expect ~18 chunks/s on this CPU**, ~600k chunks total. It is resumable —
+content hash decides staleness, so a killed run picks up where it stopped.
+
+| subcommand | does |
 |---|---|
-| `ingest/index.py full` | walk, hash, classify; idempotent |
-| `ingest/index.py verify` | manifest vs filesystem reconciliation |
-| `ingest/index.py embed [--limit N] [--shuffle] [--paths FILE] [--recreate]` | embed + upsert; resumable |
-| `ingest/index.py status` | manifest vs Qdrant drift check |
-| `eval/run_eval.py` | recall@k, MRR, latency; gate scores real cases only |
-| `scripts/golden.py find\|add\|check` | golden-set authoring (lexical only, never vector) |
-| `scripts/mine_questions.py` | mine real questions from Claude Code transcripts |
-| `scripts/baseline_tokens.py` | before/after token comparison vs naive grep |
-| `scripts/bench_embed.py` | embedding throughput per model |
-| `scripts/diagnose_rerank.py` | what the reranker moved, and whether it helped |
-| `scripts/project_chunks.py` | chunk-count projection from a sample |
-| `scripts/nightly_sync.sh [--force]` | pull + incremental reindex |
+| `full` | walk, chunk, embed, upsert — the whole pipeline |
+| `embed` | embed whatever the manifest marks pending |
+| `verify` | compare manifest against Qdrant, report drift |
+| `status` | counts by status, chunk sums, `match` |
+
+Flags: `--limit N` · `--shuffle` · `--recreate` (drops the collection) ·
+`--paths file.txt` (reindex specific rel_paths, ignoring status).
 
 ---
 
-## Testing
+## Daily use
+
+### The launcher
 
 ```bash
-python3 -m pytest tests/ -q      # 128 passed, zero skips
+ln -s "$PWD/scripts/second-brain" ~/.local/bin/second-brain
+second-brain
 ```
 
-Zero skips is deliberate. A skipped test hid a missing ripgrep for an entire phase,
-and a broken config default once turned 51 tests into silent skips. Tests that
-cannot run **fail**.
+Splash, then preflight and a session picker:
+
+```
+  ● qdrant    351,164 vectors
+  ● planner   ollama up — sn_research available
+  ● indexing  running — 8900/27480 files 18.0 chunks/s
+
+  1  05 Aug 11:07  fix the fastembed cache path
+  2  03 Aug 18:27  current obsidian vault path: ...
+
+  number to resume · u to paste a session id · Enter for a fresh session
+```
+
+The preflight exists because service state is invisible until it bites: Qdrant
+down means *every* search fails, and a stale MCP server once made
+`sn_get_section` return `NOT_FOUND` while `sn_search` kept working. Arguments
+pass straight through, so `second-brain --resume <id>` behaves like `claude`.
+
+### Asking things
+
+Just talk. Claude picks the tool.
+
+| you say | what runs |
+|---|---|
+| "how do business rules work?" | `sn_search` (agent `servicenow`) |
+| "what did I write about ACL debugging?" | `sn_search` (agent `personal`) |
+| "show me every use of `setAbortAction`" | `sn_lexical` — exact, not semantic |
+| "expand that third result" | `sn_get_section` on its `parent_id` |
+| "research X and cite sources" | `sn_research` — full local agent loop |
+| "save this summary to my vault" | `sn_ingest` |
+
+**Pick the agent deliberately** — it is a hard source filter, not a hint:
+
+- `general` — everything: official docs, personal notes, wiki, apps, code graphs
+- `servicenow` — official vendor documentation only
+- `personal` — your notes, wiki and apps only
+
+An unknown agent name is `BAD_REQUEST`, never a silent fallback to `general`.
+
+---
+
+## MCP tool reference
+
+Seven tools. **Every cap is enforced in code** (`mcp_server/caps.py`), never as a
+prompt instruction — a prompt instruction is a suggestion.
+
+### `sn_search`
+```python
+sn_search(query: str, agent: str = "general", k: int = 8,
+          doc_type: str | None = None, product: str | None = None,
+          release: str | None = None) -> dict
+```
+Hybrid dense + BM25, RRF-fused, cross-encoder reranked. The default entry point.
+Returns ranked snippets with `chunk_id`, `parent_id`, `rel_path`, `h_path`
+breadcrumb, `source`, `score`.
+**Caps:** 8 results · 150 words each · 6,000 chars total.
+
+### `sn_get_section`
+```python
+sn_get_section(parent_id: str) -> dict
+```
+One parent section verbatim, by `parent_id` from a search result. This is how you
+expand a 500-char snippet into its full 2-4k-char context.
+**Cap:** 8,000 chars.
+
+### `sn_outline`
+```python
+sn_outline(rel_path: str) -> dict
+```
+Header tree for one document — structure only, no body text. Cheap way to see
+what a large file contains before pulling any of it.
+**Cap:** 3,000 chars.
+
+### `sn_lexical`
+```python
+sn_lexical(pattern: str, agent: str = "general", fixed_string: bool = True) -> dict
+```
+Exact match via ripgrep. Use for API symbols, method names and error strings —
+anything where semantic similarity is the wrong tool. Returns `rel_path` and line
+number per hit; citations are file-level and deduped.
+**Caps:** 20 hits · 4,000 chars total.
+
+### `sn_research`
+```python
+sn_research(question: str, agent: str | None = None, budget: int = 6,
+            candidates: int = 50, use_judge: bool = True) -> dict
+```
+The full local agent loop: the planner decomposes the question, retrieval runs
+per sub-query, a local judge filters candidates, and the result is **selected
+cited evidence with a reasoning trace — not a written answer**. Synthesis is
+Claude's job (ADR-0004). Requires Ollama; returns `PLANNER_UNAVAILABLE` if it is
+down.
+**Caps:** 900 words for the whole brief · 6 items · 6,000 chars.
+
+### `sn_stats`
+```python
+sn_stats() -> dict
+```
+Index health: file counts by status, counts by source, manifest chunk sum, Qdrant
+point count, and **drift** between them. `consistent: false` means the manifest
+and vector store disagree — investigate before trusting results.
+**Cap:** 500 chars.
+
+### `sn_ingest`
+```python
+sn_ingest(source_path: str | None = None, content: str | None = None,
+          dest_rel_path: str | None = None, title: str | None = None) -> dict
+```
+**The only writer, and the only real security boundary.** Migrates a file (or
+literal content) into the vault, then chunks, embeds and upserts it so it is
+immediately searchable — no waiting for the nightly run.
+
+Rejects: absolute paths · `..` traversal · symlink escapes · null bytes ·
+non-markdown suffixes · anything targeting the `official` vendor corpus. Writes
+are confined to `VAULT_PATH`. It never deletes.
+**Cap:** 1,000 chars. Limits: 2 MB, 400 chunks per file.
+
+---
+
+## Command reference
+
+Everything you can run, in one place. All paths are relative to `sn-rag/`.
+
+### Launcher
+
+| command | does |
+|---|---|
+| `second-brain` | splash, health checks, session picker |
+| `second-brain --status` | health checks only, then exit — no session |
+| `second-brain --sessions` | list recent sessions and exit |
+| `second-brain --help` | usage |
+| `second-brain --resume <id>` | resume directly; any `claude` flag passes through |
+
+### Indexing
+
+| command | does |
+|---|---|
+| `python3 ingest/index.py full` | **walk** the corpus: hash every file, mark changed ones pending, queue deletions. Does *not* embed |
+| `python3 ingest/index.py embed` | embed + upsert everything marked pending |
+| `python3 ingest/index.py verify` | compare manifest against Qdrant, report drift |
+| `python3 ingest/index.py status` | counts by status, chunk sums, `match` |
+
+Flags for `full` / `embed`: `--limit N` · `--shuffle` · `--recreate` (drops the
+collection) · `--paths file.txt` (reindex listed rel_paths, ignoring status).
+
+**`full` and `embed` are separate on purpose.** `embed` only processes what the
+manifest already knows about; it never walks the corpus. After editing the vault,
+run `full` first or the new files are invisible:
+
+```bash
+python3 ingest/index.py full && python3 ingest/index.py embed
+```
+
+First index of a new corpus — sample before committing hours:
+
+```bash
+python3 ingest/index.py full --limit 500 --shuffle    # gate
+python3 ingest/index.py status                        # match = True
+setsid nohup python3 ingest/index.py embed --shuffle \
+  >> ~/.local/state/sn-rag/full-embed.log 2>&1 < /dev/null &
+```
+
+### Evaluation and measurement
+
+| command | does |
+|---|---|
+| `python3 -m pytest tests/ -q` | the suite (129 tests) |
+| `python3 eval/run_eval.py` | recall@k, MRR, latency across all four modes |
+| `python3 eval/run_eval.py --modes hybrid+rerank` | one mode only |
+| `python3 eval/run_eval.py --approx` | approximate HNSW, as production runs |
+| `python3 scripts/golden.py check` | golden-set coverage and provenance |
+| `python3 scripts/golden.py find <pattern>` | locate candidate docs — **lexical only, never vector search** |
+| `python3 scripts/golden.py add --id … --question …` | append a golden case |
+| `python3 scripts/baseline_tokens.py` | token savings vs reading whole files |
+| `python3 scripts/mine_questions.py` | mine real questions from session transcripts |
+| `python3 scripts/bench_embed.py` | embedding throughput sweep |
+| `python3 scripts/diagnose_rerank.py` | inspect reranker scores for one query |
+
+`run_eval.py` exit codes: **0** pass · **1** fail · **2** INCONCLUSIVE (fewer than
+20 `provenance: real` cases, or a golden set referencing missing files).
+
+### Services
+
+| command | does |
+|---|---|
+| `systemctl --user is-active qdrant.service` | is the vector store up |
+| `systemctl --user restart qdrant.service` | restart it |
+| `systemctl --user list-timers sn-rag-sync.timer` | when the nightly sync next fires |
+| `systemctl --user start sn-rag-sync.service` | run the sync now |
+| `journalctl --user -u sn-rag-sync.service -n 50` | sync logs |
+| `curl -s localhost:6333/collections/knowledge` | raw collection stats |
+| `curl -s localhost:11434/api/tags` | is the planner model loaded |
+| `sudo loginctl enable-linger "$USER"` | **headless servers only** — without it user timers never fire |
+
+### Inspecting state
+
+```bash
+python3 -c "import config; print(config.CORPUS_PATH, config.MANIFEST_DB_PATH)"
+tail -f ~/.local/state/sn-rag/full-embed.log
+pgrep -af 'index.py embed'                       # is an index job running
+```
+
+---
+
+## Keeping it current
+
+A systemd **user timer** runs nightly at 03:00:
+
+```bash
+bash scripts/systemd/install.sh          # or, by hand:
+cp scripts/systemd/sn-rag-sync.{service,timer} ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now sn-rag-sync.timer
+systemctl --user list-timers sn-rag-sync.timer
+```
+
+**User units, not system units** — deliberately. They need no root and run as the
+account that owns the corpus checkout and the model cache.
+
+The unit runs `scripts/nightly_sync.sh`: `git pull` the vault (best effort — the
+vault is live and a dirty tree must not abort the run), then an incremental
+reindex of whatever changed by content hash.
+
+**`Persistent=true` is the point.** If the machine is off at 03:00, systemd
+records the missed window and fires on the next boot. Plain cron silently skips
+until tomorrow. `OnBootSec=2min` keeps a catch-up run from racing Qdrant's
+startup; `RandomizedDelaySec=15min` keeps it off the desktop's login path.
+
+Run it by hand any time:
+
+```bash
+systemctl --user start sn-rag-sync.service
+journalctl --user -u sn-rag-sync.service -n 50
+```
+
+---
+
+## Install on a local server
+
+Full reasoning, alternatives and rejections: **`docs/adr/0005`**. Summary:
+
+### The rule: migrate the index, never rebuild it
+
+Embeddings are deterministic for a fixed model — verified during a refactor at
+`max abs elementwise diff: 0.0`. A copied collection is *identical* to a rebuilt
+one, not an approximation. On N100-class hardware a full rebuild is an estimated
+**35-50 hours**; the copy takes minutes.
+
+Bulk embedding stays on the workstation. Incremental nightly updates are cheap
+and stay on the server.
+
+### Sequence
+
+1. **Finish the index on the workstation.** Migrating a partial one wastes the trip.
+2. **Stop Qdrant, or use its snapshot API.** `rsync` of a live storage directory
+   gives a torn copy — segment files and their metadata are written independently.
+3. **Copy** — over Tailscale/WireGuard, not a Windows share:
+   ```bash
+   rsync -a ~/vaults/obsidian-servicenow-docs/  server:~/vaults/obsidian-servicenow-docs/
+   rsync -a ~/.local/qdrant/storage/            server:~/.local/qdrant/storage/
+   rsync -a ~/.local/state/sn-rag/manifest.db   server:~/.local/state/sn-rag/
+   rsync -a ~/.cache/fastembed/                 server:~/.cache/fastembed/
+   ```
+   The model cache matters: without it the server needs ~300 MB of Hugging Face
+   downloads before its first query, and fails outright if firewalled from the
+   public internet — a reasonable posture for a box holding a corporate corpus.
+4. **Verify before trusting it:**
+   ```bash
+   python3 ingest/index.py status     # match = True, counts identical to source
+   ```
+   A mismatch is a silent recall hole: searches succeed and quietly miss documents.
+5. **systemd units** for Qdrant, Ollama, the MCP server and the sync timer.
+   On a headless server, **enable lingering** or the user timers never fire with
+   nobody logged in:
+   ```bash
+   sudo loginctl enable-linger "$USER"
+   ```
+   Without it the nightly sync only catches up when you next log in — which on a
+   box you never log into means never.
+6. **Re-run the eval on the server.** Same golden set, same index — the numbers
+   should match. If they don't, something didn't migrate cleanly.
+
+### Network boundary — read before exposing anything
+
+**Qdrant and Ollama both ship with no authentication.** On a LAN address, anyone
+on your network can read the entire corpus over HTTP with no credential and no
+audit trail. This corpus originates from a corporate tenant.
+
+- Bind services to `127.0.0.1` **plus a mesh-VPN interface only** — never `0.0.0.0`
+- Set `QDRANT__SERVICE__API_KEY` anyway. Redundant with the VPN by design: a VPN
+  is a configuration, and configurations get changed
+- The MCP server must move from **stdio to streamable HTTP** to cross a machine
+  boundary, and **requires a bearer token** — `sn_ingest` is a writer
+
+### What degrades on weak hardware
+
+| symptom | first lever |
+|---|---|
+| search latency high | `RERANK_CANDIDATES` 50 → 30. recall@10 is *flat* across depths; only recall@5 and MRR drop, p95 improves 1450 ms → 883 ms |
+| `sn_research` times out | `qwen2.5:1.5b-instruct`, or lower `MAX_JUDGE_CALLS`, or run without a planner |
+| indexing starves everything | `EMBED_THREADS` — throughput plateaus at 6 anyway, so capping costs nothing |
+
+---
+
+## Configuration
+
+`config.py` is the single source of truth. Everything below is an environment
+variable override.
+
+### Paths
+| variable | default | notes |
+|---|---|---|
+| `CORPUS_PATH` | `~/vaults/obsidian-servicenow-docs` | ordered candidate list, never cwd-relative |
+| `MANIFEST_DB_PATH` | `~/.local/state/sn-rag/manifest.db` | on ext4 — 24× faster fsync |
+| `MODEL_CACHE_PATH` | `~/.cache/fastembed` | fastembed's own default is a tempdir, wiped on reboot |
+| `VAULT_PATH` | = `CORPUS_PATH` | write root for `sn_ingest` |
+
+### Vector store and embedding
+| variable | default |
+|---|---|
+| `QDRANT_URL` | `http://localhost:6333` |
+| `QDRANT_COLLECTION` | `knowledge` |
+| `DENSE_MODEL` | `BAAI/bge-base-en-v1.5` |
+| `SPARSE_MODEL` | `Qdrant/bm25` |
+| `EMBED_BATCH_SIZE` | `32` — measured 8→8.0, 32→12.1, 64→8.9 chunks/s |
+| `EMBED_THREADS` | `6` — plateaus here; uncapped it starved the planner for hours |
+| `UPSERT_FILE_BATCH` | `25` |
+
+### Retrieval
+| variable | default |
+|---|---|
+| `RERANK_MODEL` | `Xenova/ms-marco-MiniLM-L-6-v2` |
+| `RERANK_CANDIDATES` | `50` — from a measured 30/50/100/200 sweep |
+| `RERANK_TOP_K` | `8` |
+| `SEARCH_HNSW_EF` | `128` |
+| `EVAL_EXACT_SEARCH` | `1` — eval must be deterministic; HNSW noise exceeds the effects measured |
+
+### Planner
+| variable | default |
+|---|---|
+| `PLANNER_BASE_URL` | `http://localhost:11434/v1` — **never point this at a paid endpoint** |
+| `PLANNER_MODEL` | `qwen2.5:3b-instruct` |
+| `PLANNER_MAX_TOKENS` | `256` |
+| `PLANNER_TIMEOUT_SECONDS` | `30` |
+
+### Ingest
+| variable | default |
+|---|---|
+| `INGEST_DEFAULT_DIR` | `raw/inbox` |
+| `INGEST_MAX_BYTES` | `2097152` (2 MB) |
+| `INGEST_MAX_CHUNKS` | `400` |
+
+### Not overridable — code constants, deliberately
+Chunk sizes (`PARENT_CHUNK_MIN/MAX_CHARS` 2000/4000, `CHILD_CHUNK_CHARS` 500,
+`CHILD_CHUNK_OVERLAP` 100) · all output `CAPS` · `MAX_TOOL_CALLS` 12 ·
+`MAX_ITERATIONS` 6 · `SOURCE_BY_TOP_DIR` · `EXCLUDED_DIRS` · `EXCLUDED_FILENAMES`.
+
+---
+
+## Troubleshooting
+
+**Every search fails / `BACKEND_UNAVAILABLE`**
+```bash
+systemctl --user is-active qdrant.service
+curl -s localhost:6333/collections/knowledge | head -c 200
+```
+
+**`sn_research` returns `PLANNER_UNAVAILABLE`**
+Ollama is down, or starved of CPU. Both are real causes — a full reindex once
+took 11 of 12 cores and the planner timed out for hours. That is what
+`EMBED_THREADS=6` prevents.
+```bash
+curl -s localhost:11434/api/tags
+```
+
+**`sn_search` works but `sn_get_section` returns `NOT_FOUND`**
+The MCP server is reading the wrong manifest — search hits Qdrant, section
+lookups hit SQLite. Usually a leftover server process from an older registration.
+Restart the Claude Code session, and delete any stray `sn-rag/manifest.db` (the
+second path candidate) so it cannot shadow the real one.
+
+**`sn_stats` shows `consistent: false`**
+Drift between manifest and Qdrant. `python3 ingest/index.py verify` to see it,
+`status` for counts. Surplus vectors self-heal; missing ones do not.
+
+**Indexing is slow, or makes everything else unusable**
+~18 chunks/s is expected. If the machine is unusable, lower `EMBED_THREADS`.
+
+**Tests skip silently**
+Usually a missing corpus or missing ripgrep. 51 tests once skipped quietly
+because `rg` was absent. Read the skip reasons, not just the pass count.
+
+**Models re-download after every reboot**
+`MODEL_CACHE_PATH` unset and fastembed defaulted to a tempdir. Fixed by default
+now; verify with `python3 -c "import config; print(config.MODEL_CACHE_PATH)"`.
+
+---
+
+## Testing and evaluation
+
+```bash
+python3 -m pytest tests/ -q                    # 129 passed
+python3 eval/run_eval.py --golden eval/golden.yaml
+python3 scripts/baseline_tokens.py             # token savings vs reading files
+python3 scripts/golden.py check                # golden-set coverage
+```
+
+**Tests passing is not sufficient evidence.** Several real defects here were
+found by inspecting output *after* a green suite — an empty payload field, a
+breadcrumb off by one section, a lock that never engaged. When a test passes on
+the first try, check that it could have failed.
+
+### The golden set is human-authored and cannot be generated
+
+Questions written by reading a document inherit its vocabulary, so recall comes
+out near-perfect and measures nothing. Every case carries
+`provenance: real | constructed | negative`:
+
+- **real** — asked before the answer was known. The only kind that scores the gate.
+- **constructed** — written while reading docs. Regression signal only.
+- **negative** — the corpus genuinely cannot answer it; tests fabrication.
+
+Below 20 real cases, `run_eval.py` exits **2 = INCONCLUSIVE** rather than
+reporting a blended number. Current: **3 real, 26 constructed**. The constructed
+`personal` cases score **1.000** — that perfect score *is* the circularity, left
+visible on purpose.
+
+Do not "fix" this by lowering `MIN_REAL_CASES`. The mining path is exhausted: 247
+user messages across 18 transcripts yielded 5 domain questions, all already
+present. See `docs/GOLDEN-SET-GUIDE.md`.
+
+---
+
+## Status
+
+| area | state | evidence |
+|---|---|---|
+| ingest + chunking | done | property tests, 129 passing |
+| embedding | ~18 chunks/s | `full-embed.log` |
+| hybrid + rerank | done | measured sweep in `BUILD-LOG.md` |
+| MCP surface | 7 tools, capped in code | `tests/test_mcp.py` |
+| agent loop | done | ADR-0004 |
+| nightly sync | done | systemd timer, `Persistent=true` |
+| token savings | **78.5×** (3,040,367 → 38,713 over 29 cases) | `scripts/baseline_tokens.py` |
+| **Phase 4 recall gate** | **INCONCLUSIVE — not passed** | 3 real cases, needs 20 |
+
+The token figures are solid. **The 0.862 hit rate is provisional** — it rests on
+constructed cases, and constructed cases measure the author's vocabulary rather
+than retrieval. Reporting it as passed would make this README read better and the
+project less trustworthy.
 
 ---
 
 ## Layout
 
 ```
-config.py            single source of truth: models, sizes, caps, budgets
-ingest/              normalize · manifest · chunker (pure) · embed · index CLI
-retrieval/           hybrid · rerank · lexical · parents · profiles (search agents)
-agent/               planner (local, structured output only) · research loop
-mcp_server/          server · caps (cost boundary) · ingest_tool (security boundary)
-eval/                golden.yaml (provenance-tagged) · run_eval.py
-scripts/             benchmarks, golden-set tools, mining, sync + systemd units
-tests/               chunker · retrieval · mcp · planner
-docs/                ARCHITECTURE · BUILD-LOG · GOLDEN-SET-GUIDE · adr/
+sn-rag/
+├── config.py              single source of truth: paths, models, caps, budgets
+├── requirements.txt
+├── ingest/
+│   ├── index.py           CLI: full · embed · verify · status
+│   ├── chunker.py         PURE — no I/O, no network. Property-tested.
+│   ├── embed.py           length-sorted batching + Qdrant upsert
+│   ├── manifest.py        SQLite: sha256 staleness, parents, chunks
+│   └── normalize.py       source classification, frontmatter, facets
+├── retrieval/
+│   ├── hybrid.py          dense + sparse, RRF fusion
+│   ├── rerank.py          cross-encoder
+│   ├── lexical.py         ripgrep
+│   └── profiles.py        general · servicenow · personal
+├── agent/
+│   ├── planner.py         local JSON-only planner + judge
+│   └── research.py        the Phase 5 loop
+├── mcp_server/
+│   ├── server.py          7 tools, stdio transport
+│   ├── caps.py            output caps, enforced in code
+│   └── ingest_tool.py     path containment — the security boundary
+├── eval/
+│   ├── run_eval.py        recall@k, MRR, latency, provenance gate
+│   └── golden.yaml        human-authored, cannot be generated
+├── scripts/
+│   ├── second-brain       the launcher
+│   ├── nightly_sync.sh    git pull + incremental reindex
+│   ├── golden.py          authoring tools (lexical only, never vector search)
+│   ├── baseline_tokens.py token-savings measurement
+│   └── systemd/           qdrant.service, sn-rag-sync.{service,timer}
+├── tests/                 129 tests
+└── docs/
+    ├── ARCHITECTURE.md
+    ├── BUILD-LOG.md       every number, with the command that produced it
+    ├── GOLDEN-SET-GUIDE.md
+    └── adr/               0001-0005
 ```
-
----
-
-## Documentation
-
-| file | what |
-|---|---|
-| `docs/ARCHITECTURE.md` | how it works and why it is shaped that way |
-| `docs/BUILD-LOG.md` | phase-by-phase record: commands, raw output, defects, rejected options |
-| `docs/GOLDEN-SET-GUIDE.md` | how to write the evaluation set, and why provenance matters |
-| `docs/adr/0001` | generic core, ServiceNow as a profile |
-| `docs/adr/0002` | Qdrant native binary vs Docker |
-| `docs/adr/0003` | MCP tool surface and synchronous ingest |
-| `docs/adr/0004` | the planner plans; Claude synthesizes |
-
-`BUILD-LOG.md` records measurements with the commands that produced them, including
-benchmarks that were **wrong the first time** — a recorded 92.4 chunks/s that the
-real pipeline never achieved, a reranker wrongly accused of destroying recall, and a
-token baseline that read 905x before three defects in it were fixed. That history is
-deliberate: a number without its command is not evidence.
 
 ---
 
 ## Ground rules
 
-Carried from the build spec and enforced in review:
+These are why the numbers here can be trusted.
 
-1. No `TODO`/`pass`/stub in committed non-test code.
-2. No mocked or random embeddings outside a named test double.
-3. **No performance, recall or token number without the command that produced it.**
-4. No `except: pass`, no handler returning an empty success.
-5. No retrieval-quality claim without an eval run against `golden.yaml`.
-6. Output caps enforced in code, never as prompt instructions.
-7. No silent model fallback — failure is explicit (`PLANNER_UNAVAILABLE`).
-8. No full-corpus index before the 500-doc sample gate passes.
-9. No architectural change without an ADR recording what was rejected.
-
-Tests passing is not sufficient evidence. Most real defects in this project were
-found by inspecting actual output *after* a green suite.
+1. **Every number comes with the command that produced it.** A figure without its
+   command is not evidence — it goes in `BUILD-LOG.md` with raw output.
+2. **No mocked or random embeddings** outside a clearly named test double.
+3. **No `TODO`, `pass`, `NotImplementedError`** in committed non-test code.
+4. **No `except: pass`**, and no handler returning an empty success. Backends fail
+   with structured errors.
+5. **No retrieval-quality claim without an eval run.**
+6. **Output caps in code, never in prompts.**
+7. **No architectural change without an ADR** recording rejected alternatives.
+8. **Benchmark the code path you ship.** A benchmark that called `embed()` once
+   over a whole list reported 92.4 chunks/s while production sustained 6.7. That
+   number sat in the build log for three phases and funded a plan that was never
+   achievable.

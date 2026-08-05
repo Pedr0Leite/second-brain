@@ -1,0 +1,29 @@
+# sn-rag runtime dependencies.
+#
+# Pinned to the versions this system was built and measured against. Everything
+# else (numpy, onnxruntime, tokenizers, huggingface-hub) arrives transitively
+# through fastembed — listed below as a comment rather than pinned here, so
+# fastembed stays free to resolve its own compatible set.
+#
+# Install (this box has no working `python3 -m venv` — ensurepip is unavailable):
+#     pip install --user --break-system-packages -r requirements.txt
+# On a normal machine, prefer a virtualenv:
+#     python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+
+fastembed==0.8.0          # dense + sparse + cross-encoder, all ONNX on CPU
+qdrant-client==1.18.0     # must stay compatible with the Qdrant server (1.18.3)
+mcp==2.0.0                # MCP SDK — the stdio server Claude Code spawns
+PyYAML==6.0.3             # eval/golden.yaml
+
+# Dev / evaluation only:
+pytest==9.1.1
+
+# Deliberately NOT dependencies:
+#   openai / httpx  - the planner speaks to Ollama over stdlib urllib. Adding an
+#                     SDK whose default base_url is a paid endpoint is exactly
+#                     the accident this project is built to prevent (ADR-0004).
+#   torch           - fastembed runs ONNX; there is no GPU here and no CUDA stack.
+#   docker          - Qdrant runs from its official static binary (ADR-0002).
+#
+# Transitively installed by fastembed, verified working at:
+#   numpy 2.5.1 · onnxruntime 1.28.0 · tokenizers 0.23.1 · requests 2.32.5

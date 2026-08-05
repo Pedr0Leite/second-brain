@@ -1700,3 +1700,31 @@ dense dim: 768
 $ python3 -m pytest tests/ -q
 129 passed in 49.15s
 ```
+
+### OPEN — parent breadcrumb does not match the child that matched
+
+Found during a health check, deferred until the full embed finishes (it competes
+for CPU). Not data loss; the section body is correct.
+
+```
+$ sn_search("GlideAggregate groupBy count", agent="servicenow", k=2)
+h_path: GlideAggregate- Scoped > Scoped GlideAggregate - groupBy(String name)
+parent_id: 48ceaa655c7b352bbfde681c5bfe30ae9832d2df
+
+$ sn_get_section("48ceaa655c7b352bbfde681c5bfe30ae9832d2df")
+h_path: GlideAggregate- Scoped > Scoped GlideAggregate - getTableName()
+```
+
+The parent spans three API sub-sections (`getTableName`, `getValue`, `groupBy`)
+and is labelled with the FIRST header it contains, not the one the matching child
+came from. Following a citation labelled `groupBy` lands on something labelled
+`getTableName`.
+
+Unknown whether this is systematic or specific to densely-headed API reference
+files, where many small `##` sections fit inside one 2-4k-char parent. Check both
+before changing anything — the fix might belong in how `sn_get_section` reports
+h_path (echo the requesting child's breadcrumb) rather than in the chunker, which
+is pure and property-tested.
+
+This is the same shape as the breadcrumb defect found in Phase 2, which is why it
+is written down rather than waved through.
