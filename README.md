@@ -274,26 +274,53 @@ curl -s localhost:11434/api/tags     # should list the model
 
 Skip this and everything except `sn_research` works normally.
 
-### 6. Register the MCP server with Claude Code
+### 6. Register with Claude Code
 
-Run from the **project directory** you want it available in — scope follows cwd:
+One command registers the MCP server **and** installs the `/second-brain` slash
+command. Idempotent — re-run it after any `git pull`:
 
 ```bash
-cd /path/to/second-brain
-claude mcp add sn-rag \
+cd sn-rag
+./scripts/install.sh                 # add --dry-run to see it first
+```
+
+It resolves `CORPUS_PATH` and `MANIFEST_DB_PATH` by importing `config`, so the
+registration can't drift from what the code actually reads. It refuses to run if
+the `claude` CLI, `python3` or the server file is missing — registering a server
+that can't start is worse than not installing, because it looks configured. An
+edited `~/.claude/commands/second-brain.md` is backed up, never silently
+overwritten.
+
+Defaults to `--scope=user` (available in every project on this machine). Use
+`--scope=project` only deliberately: it writes `.mcp.json`, which gets committed
+and carries machine-specific absolute paths.
+
+Manual equivalent, if you'd rather not run a script:
+
+```bash
+claude mcp add sn-rag --scope user \
   --env CORPUS_PATH=$HOME/vaults/obsidian-servicenow-docs \
   --env MANIFEST_DB_PATH=$HOME/.local/state/sn-rag/manifest.db \
   -- python3 /full/path/to/sn-rag/mcp_server/server.py
+cp scripts/commands/second-brain.md ~/.claude/commands/
 ```
-
-Add `--scope user` to make it available in every project.
 
 ### 7. Verify
 
 ```bash
 python3 -c "import config; print(config.CORPUS_PATH, config.MANIFEST_DB_PATH)"
-python3 -m pytest tests/ -q          # 129 passed
+python3 -m pytest tests/ -q          # 144 passed
+claude mcp list                      # sn-rag listed
 ```
+
+Then, in a **new** Claude Code session:
+
+```
+/second-brain what is a business rule
+```
+
+A session started before installing won't see either change — the MCP server is
+spawned once per session and caches its modules at spawn.
 
 ---
 
@@ -780,19 +807,80 @@ present. See `docs/GOLDEN-SET-GUIDE.md`.
 
 | area | state | evidence |
 |---|---|---|
-| ingest + chunking | done | property tests, 129 passing |
-| embedding | ~18 chunks/s | `full-embed.log` |
+| corpus indexed | **51,588 files · 505,507 chunks · `match = True`** | `index.py status` |
+| ingest + chunking | done | property tests, 144 passing |
+| embedding | **17.6 chunks/s** | `sample_gate.log`, 5,007 chunks in 284s |
 | hybrid + rerank | done | measured sweep in `BUILD-LOG.md` |
 | MCP surface | 7 tools, capped in code | `tests/test_mcp.py` |
-| agent loop | done | ADR-0004 |
+| agent loop | done, **underperforming plain search** | see below |
 | nightly sync | done | systemd timer, `Persistent=true` |
 | token savings | **78.5×** (3,040,367 → 38,713 over 29 cases) | `scripts/baseline_tokens.py` |
 | **Phase 4 recall gate** | **INCONCLUSIVE — not passed** | 3 real cases, needs 20 |
 
+### Measured retrieval quality, full clean index (2026-08-05)
+
+`python3 eval/run_eval.py`, `hybrid+rerank`, 29 scorable cases:
+
+| profile | recall@5 | recall@10 | MRR |
+|---|---|---|---|
+| personal | 0.769 | 0.846 | 0.550 |
+| general | 0.600 | 0.600 | 0.600 |
+| **servicenow** | **0.273** | **0.455** | **0.149** |
+
+**`servicenow` is the weak profile, and it is 99.3% of the corpus.** MRR 0.149
+with recall@10 0.455 means that when the right document *is* found, it sits near
+the bottom of the list rather than the top.
+
+`python3 scripts/diagnose_rerank.py --profile servicenow` locates the stage that
+loses it — and it is not the reranker:
+
+```
+never retrieved in 30 candidates : 4  ['acl-table-vs-field', 'acl-read-denied',
+                                       'glideform-readonly', 'gliderecord-client']
+in hybrid top-10, LOST by rerank : 1
+rescued by rerank                : 1
+ok                               : 5
+```
+
+Reranking is net-neutral (one lost, one rescued). **4 of 11 cases never retrieve
+the expected document at all**, which no amount of reordering can fix. All four
+are API-symbol questions against documents named after the API — the signal that
+`EMBED_DOC_TITLE` exists to restore.
+
+### The agent loop is currently worse than plain search
+
+`python3 scripts/eval_planner.py --models qwen2.5:3b-instruct --judge-arms`:
+
+| arm | recall | routing | p50 | p95 | judged | dropped |
+|---|---|---|---|---|---|---|
+| `+judge` | 0.345 | 0.621 | 11.2s | 15.3s | 311 | 265 |
+| `-judge` | 0.379 | 0.621 | **3.5s** | 5.2s | 0 | 0 |
+
+Plain `hybrid+rerank` over the same cases scores ~0.53 at k=5. **`sn_research`
+retrieves worse than `sn_search` while costing 3-11 seconds.** The judge is not
+the cause — dropping it is 3.2× faster with recall a statistical tie (3 of 29
+cases disagreed, 1 favouring the judge). Query decomposition is the remaining
+suspect. Until that is resolved, prefer `sn_search` and `sn_lexical`.
+
+### A bigger planner model does not help
+
+`--models qwen2.5:3b-instruct qwen2.5:7b-instruct`, 29 cases:
+
+| model | recall | routing | p50 | idle tok/s |
+|---|---|---|---|---|
+| qwen2.5:3b-instruct | 0.310 | 0.621 | 12.1s | 25-27 |
+| qwen2.5:7b-instruct | 0.276 | 0.586 | 22.3s | 10.9-11.6 |
+
+7B is worse on every axis and 1.8× slower. Only 5 of 29 cases disagreed, split
+3-2, so the quality difference is noise — but the latency difference is not.
+**Keep the 3B.**
+
 The token figures are solid. **The 0.862 hit rate is provisional** — it rests on
 constructed cases, and constructed cases measure the author's vocabulary rather
 than retrieval. Reporting it as passed would make this README read better and the
-project less trustworthy.
+project less trustworthy. The same caveat applies to every table above: 26 of the
+29 cases are constructed, and `personal` scoring 1.000 on them is that
+circularity made visible.
 
 ---
 

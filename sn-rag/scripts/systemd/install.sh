@@ -19,9 +19,16 @@ UNIT_DIR="$HOME/.config/systemd/user"
 ENV_DIR="$HOME/.config/sn-rag"
 mkdir -p "$UNIT_DIR" "$ENV_DIR"
 
+# Resolve the manifest through config rather than hardcoding it. This line used
+# to read "$SN_RAG_DIR/manifest.db", which on this layout is a repo-local path on
+# /mnt/c that sqlite happily CREATES EMPTY — the nightly sync would then index
+# into a database nothing else reads, reporting success the whole time. That
+# failure has happened once already; see CLAUDE.md "Environment".
+MANIFEST_DB_PATH="${MANIFEST_DB_PATH:-$(cd "$SN_RAG_DIR" && python3 -c 'import config; print(config.MANIFEST_DB_PATH)')}"
+
 cat > "$ENV_DIR/sync.env" <<EOF
 CORPUS_PATH=$CORPUS_PATH
-MANIFEST_DB_PATH=$SN_RAG_DIR/manifest.db
+MANIFEST_DB_PATH=$MANIFEST_DB_PATH
 QDRANT_URL=$QDRANT_URL
 SN_RAG_DIR=$SN_RAG_DIR
 PYTHONPATH=$SN_RAG_DIR
