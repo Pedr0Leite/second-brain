@@ -113,12 +113,20 @@ bring_up() {
   # Ollama is optional: only sn_research needs it, and its absence is a clean
   # PLANNER_UNAVAILABLE rather than a broken system. Never treat it as fatal,
   # and never install it from here.
+  #
+  # Ollama's official installer creates a SYSTEM unit, not a user one, so the
+  # user scope is checked second and a system unit is reported rather than
+  # started: starting it needs sudo, and a launcher that silently prompts for a
+  # root password is worse than one that tells you what to run.
   if ! timeout 2 curl -s "http://localhost:11434/api/tags" >/dev/null 2>&1; then
-    if systemctl --user list-unit-files ollama.service >/dev/null 2>&1 \
-       && systemctl --user cat ollama.service >/dev/null 2>&1; then
-      printf "  starting ollama\n"
+    if systemctl --user cat ollama.service >/dev/null 2>&1; then
+      printf "  starting ollama (user unit)\n"
       systemctl --user start ollama.service 2>/dev/null || true
       wait_for ollama "http://localhost:11434/api/tags" || true
+    elif systemctl cat ollama.service >/dev/null 2>&1; then
+      printf "  ollama is a system unit — start it with: sudo systemctl start ollama\n"
+    else
+      printf "  ollama not installed — sn_research unavailable, everything else works\n"
     fi
   fi
 
