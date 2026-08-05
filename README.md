@@ -57,7 +57,7 @@ Two consequences follow, and they explain most of the design:
 ## Contents
 
 - [Architecture](#architecture) · [Do I need Obsidian?](#do-i-need-obsidian)
-- [Requirements](#requirements) · [Install](#install) · [Build the index](#build-the-index)
+- [Requirements](#requirements) · [Install](#install) ([one command](#the-short-way--one-command)) · [Build the index](#build-the-index)
 - [Daily use](#daily-use) · [MCP tool reference](#mcp-tool-reference)
 - [Command reference](#command-reference)
 - [Keeping it current](#keeping-it-current) · [Install on a local server](#install-on-a-local-server)
@@ -212,6 +212,63 @@ endpoint is exactly the accident this project exists to prevent.
 ---
 
 ## Install
+
+### The short way — one command
+
+On a fresh machine:
+
+```bash
+git clone <your-vault-repo>  ~/vaults/obsidian-servicenow-docs
+git clone <this-repo>        ~/second-brain
+cd ~/second-brain/sn-rag/scripts && ./bootstrap.sh
+
+loginctl enable-linger $USER      # headless boxes only — see below
+```
+
+`bootstrap.sh` prompts for exactly three things — the vault path, whether to
+install Ollama (default **no**), and whether to enable the nightly sync timer
+(default yes) — then does everything in the numbered sections below: Python
+packages, ripgrep, the Qdrant binary and its systemd unit, directories, MCP
+registration, the `/second-brain` command and the `second-brain` launcher.
+
+It is **idempotent**. Re-running it after a `git pull` is the upgrade path.
+
+Two rules:
+
+- **Never `sudo` it.** That installs into `/root/.claude` and registers the MCP
+  server for root, which your own session never sees. It looks installed and is
+  not. Same for `install.sh`.
+- **`bash ./bootstrap.sh` if the exec bit is missing.** This repo is authored on
+  a checkout with `core.filemode false`; the scripts are recorded `100755` now,
+  but `bash <file>` needs only read permission and always works.
+
+The last thing it does is verify **nine components independently** rather than
+trusting the steps that just ran, so an all-clear at the end is measured.
+
+`loginctl enable-linger` matters on a headless server: without it, user units
+stop when you log out, so Qdrant dies with your SSH session and the next query
+finds nothing on `:6333`.
+
+**What it deliberately does not do:**
+
+| not done | why |
+|---|---|
+| build the index | ~8 hours. Per [ADR-0005](sn-rag/docs/adr/0005-server-deployment-migrate-the-index-never-rebuild-it.md) you copy a snapshot from a machine that has one — see [Install on a local server](#install-on-a-local-server) |
+| clone the corpus | separate repo, and the path must match what `config.CORPUS_PATH` resolves to |
+| install Ollama | prompted, defaults to no. Only `sn_research` needs it, and `sn_research` currently retrieves *worse* than plain `sn_search` (0.345 vs ~0.53) |
+
+Then check it:
+
+```bash
+second-brain --status      # qdrant + planner health
+second-brain --up          # start the services if anything is down
+```
+
+### The long way
+
+Everything below is what `bootstrap.sh` automates. Read it when something fails,
+when you want a non-standard layout, or when you would rather not run a script
+that touches systemd.
 
 ### 1. Python packages
 
