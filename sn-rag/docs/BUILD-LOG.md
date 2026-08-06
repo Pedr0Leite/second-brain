@@ -2214,3 +2214,57 @@ $ python3 -c "from mcp_server import server as S; print(len(S.register_tools('ht
 The conclusion was correct by luck; the method would have concealed a genuinely
 missing tool. The prompt in `docs/REMOTE-ACCESS.md` now forbids adjusting a
 criterion to fit an observation and requires reporting the disagreement instead.
+
+### Functional pass from the workstation, and a characteristic worth naming
+
+Five tools exercised remotely over HTTP from `192.168.1.178`. Agent scoping,
+lexical search, section expansion and caps all work across the network:
+
+- `sn_search` / `servicenow`, "how do I prevent a business rule from running
+  recursively": top hits `build-workflows/.../c_BusinessRules.md` (7.5564),
+  `api-reference/.../c_BusinessRules.md` (6.5191), and
+  `code-snippets/.../Preventing Recursive Updates from Integrations/README.md`
+  (5.5206)
+- same query, agent `personal`: **different** results, all negative-scored —
+  agent scoping is genuinely applied server-side, not ignored
+- `sn_lexical "current.setAbortAction"`: `available: 20, returned: 15,
+  5 dropped for budget` — the cap engaging in code, remotely
+- **negative control** `"GlideFluxCapacitor API temporal rollback"`: no invented
+  API. Eight results, all negative-scored, all about real unrelated features
+
+#### `sn_get_section` returning a broader heading is correct, not the old bug
+
+The client flagged a mismatch: the search hit's `h_path` was "Prevent recursive
+business rules", but `sn_get_section` on its `parent_id` returned "Business rule
+actions". CLAUDE.md records "a breadcrumb off by one section" as a past defect,
+so this was checked rather than waved through:
+
+```bash
+$ sn_get_section parent_id=06d8f85c9dd44d596b9885651490908595a85b2a
+h_path: Classic Business rules > How business rules work > Business rule actions
+text:   "### Business rule actions ... ### Prevent recursive business rules ..."
+```
+
+The parent **contains** the child's section verbatim. By design in
+`ingest/chunker.py`: parents accumulate blocks until `min_chars` and take
+`group[0].h_path` (line 231), so one parent spans several headings and is
+labelled by the first; children carry their own deeper breadcrumb (line 317).
+Containment is the correctness property, and it holds.
+
+#### "Not found" is not a distinct response
+
+Both the `personal` query and the fabricated-API control returned a **normal
+payload** — 7 and 8 results — distinguished from a good answer only by negative
+rerank scores. There is no score floor and no empty-result path.
+
+The client interpreted it correctly, but that honesty came from the caller's
+care, not from a server guarantee: the two responses are structurally identical
+to a successful one. A caller that ignored scores could present `GlideAggregate`
+documentation as though it answered a question about `GlideFluxCapacitor`.
+
+Recorded as a known characteristic, not fixed. A score floor on `sn_search`
+would make it a code-level property, but per the evidence rules that requires an
+ADR and an eval run against `eval/golden.yaml` — and the Phase 4 gate is already
+INCONCLUSIVE (3 real cases, needs 20), so there is currently no trustworthy way
+to measure whether a threshold costs recall. Fixing it on intuition would be
+exactly the kind of unmeasured change this log exists to prevent.

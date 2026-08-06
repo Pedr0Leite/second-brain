@@ -373,12 +373,9 @@ export SN_RAG_TOKEN=$(python3 -c "import secrets; print(secrets.token_urlsafe(32
 python3 mcp_server/server.py --http --bind 100.x.y.z --port 8079
 ```
 
-Clients then register a URL rather than a command:
-
-```bash
-claude mcp add --transport http sn-rag http://100.x.y.z:8079/mcp -s user \
-  --header "Authorization: Bearer $SN_RAG_TOKEN"
-```
+Clients then register a URL rather than a command — see
+[Registering a client machine](#registering-a-client-machine-workstation-laptop)
+below for the full procedure.
 
 Three things are enforced **in code**, not by convention:
 
@@ -394,6 +391,95 @@ Three things are enforced **in code**, not by convention:
 > defaults to `0.0.0.0`; so does Ollama. An authenticated MCP server in front of
 > a datastore that answers the network directly protects nothing. Verify with
 > `ss -ltnp | grep -E '6333|11434'` — both must show `127.0.0.1`.
+
+**Run it as a service, and reach it from elsewhere:**
+`docs/REMOTE-ACCESS.md` is the step-by-step for three cases — same-LAN clients,
+remote clients over a zero-trust/mesh VPN (preferred), and remote clients through
+a router port-forward restricted to whitelisted IPs (ADR-0008). It covers the
+systemd unit, token generation and rotation, the firewall, and the two failure
+modes that look like bugs but are not: `Invalid Host header` from an unlisted
+`Host`, and `Missing session ID` from a raw `curl`.
+
+Check what is actually exposed before trusting any of it:
+
+```bash
+./scripts/audit-exposure.sh     # off-box listeners, the two invariants, ufw state
+sudo ./scripts/setup-firewall.sh
+```
+
+### Registering a client machine (workstation, laptop)
+
+Two machines, two different setups. Getting this wrong is the single most likely
+mistake, because the wrong one still reports `✔ Connected`.
+
+| where | transport | tools | reaches |
+|---|---|---|---|
+| **on the server** (the box holding the index) | stdio | **7** — includes `sn_ingest` | itself, in-process |
+| **any other machine** | HTTP | **6** — no writer | the server, over the network |
+
+**1. On the server, print the exact registration command.** It embeds the live
+token, so nothing has to be retyped:
+
+```bash
+echo "claude mcp add --transport http sn-rag http://$(hostname -I | awk '{print $1}'):8079/mcp -s user --header \"Authorization: Bearer $(grep SN_RAG_TOKEN ~/.config/sn-rag/http.env | cut -d= -f2)\""
+```
+
+**2. On the client, remove any existing `sn-rag` registration first.** The names
+collide, and `add` will not silently replace one:
+
+```bash
+claude mcp remove sn-rag
+claude mcp list                  # confirm it is gone
+```
+
+> **If the client has its own checkout of this repo, this step is not optional.**
+> A leftover stdio entry (`python3 .../mcp_server/server.py`) spawns a *local*
+> server that queries the client's own — probably empty — Qdrant. It reports
+> `✔ Connected` because the process started, not because it found an index, and
+> then answers with silently fewer results. This is the failure mode the project
+> cares most about.
+
+**3. Paste the command from step 1**, then **start a new Claude Code session.**
+MCP servers are spawned once per session; a running one will not pick up the
+change.
+
+**4. Verify against something that cannot be faked.** `✔ Connected` only means a
+process started, so check the tool surface instead:
+
+```bash
+claude mcp list                  # sn-rag ... ✔ Connected
+```
+
+- **6 tools and no `sn_ingest`** → the server is answering. `sn_ingest` is never
+  registered over HTTP, so its absence cannot be faked by a local process.
+- **7 tools with `sn_ingest`** → still a local stdio server. Go back to step 2.
+
+Then confirm the index is the real one — `sn_stats` should report the server's
+chunk count, not a local fragment.
+
+**Debugging a client that will not connect.** Run this from the client; each
+response means something specific:
+
+```bash
+curl -sv http://<server-ip>:8079/mcp 2>&1 | tail -20
+```
+
+| response | meaning |
+|---|---|
+| `401` + `www-authenticate: Bearer` | **working.** Network, firewall, bind and auth are all fine; only the token is missing from this bare request |
+| connection timeout | no network path — firewall rule, wrong address, or the client is not on the LAN |
+| connection refused | reached the host, nothing listening — check `systemctl --user status sn-rag-mcp-http.service` |
+| `421 Invalid Host header` | the address the client used is not in `SN_RAG_ALLOWED_HOSTS` (see `docs/REMOTE-ACCESS.md`) |
+
+With the token added, the same request returns `Missing session ID` — that is
+**success**: it passed auth and failed later, at the MCP handshake, because
+`curl` is not an MCP client.
+
+> **A firewall does not cover Docker.** Containers published as `-p 8080:8080`
+> bind `0.0.0.0` and write iptables rules *below* ufw, so `ufw deny 8080` does
+> not close them. Restrict them per-container instead —
+> `ports: ["127.0.0.1:8080:8080"]` — then recreate. `audit-exposure.sh` flags
+> every container that is published this way.
 
 ### 7. Verify
 
@@ -711,7 +797,8 @@ journalctl --user -u sn-rag-sync.service -n 50
 
 ## Install on a local server
 
-Full reasoning, alternatives and rejections: **`docs/adr/0005`**. Summary:
+Full reasoning, alternatives and rejections: **`docs/adr/0005`**. Once it is
+running, **`docs/REMOTE-ACCESS.md`** covers reaching it from other machines.
 
 ### The rule: migrate the index, never rebuild it
 
@@ -760,11 +847,19 @@ and stay on the server.
 on your network can read the entire corpus over HTTP with no credential and no
 audit trail. This corpus originates from a corporate tenant.
 
-- Bind services to `127.0.0.1` **plus a mesh-VPN interface only** — never `0.0.0.0`
-- Set `QDRANT__SERVICE__API_KEY` anyway. Redundant with the VPN by design: a VPN
-  is a configuration, and configurations get changed
-- The MCP server must move from **stdio to streamable HTTP** to cross a machine
-  boundary, and **requires a bearer token** — `sn_ingest` is a writer
+- Bind **Qdrant and Ollama** to `127.0.0.1`, always. Verify, do not assume:
+  `./scripts/audit-exposure.sh` checks both and fails loudly
+- Set `QDRANT__SERVICE__API_KEY` if it must ever leave loopback. Redundant with a
+  VPN by design: a VPN is a configuration, and configurations get changed
+- The **MCP server** moves from stdio to streamable HTTP to cross a machine
+  boundary, and **requires a bearer token** — `sn_ingest` is a writer, and is not
+  registered on the HTTP surface at all
+
+ADR-0006 originally argued the MCP server itself should reach the network only
+over a mesh VPN. **ADR-0008 relaxes that** to also permit a LAN bind and, behind
+a host firewall whitelist, a router port-forward — with the plaintext-HTTP
+exposure that implies recorded there rather than glossed over. Procedure:
+`docs/REMOTE-ACCESS.md`.
 
 ### What degrades on weak hardware
 
