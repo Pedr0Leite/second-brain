@@ -2025,3 +2025,192 @@ Ollama answers trivial HTTP instantly but cannot get scheduled for inference.
 The failure is the correct one (`PLANNER_UNAVAILABLE`, never a silent fallback to
 a paid route). `git diff --stat HEAD -- agent/ retrieval/` is empty: this change
 touched neither. Re-run the planner tests once the index finishes.
+
+---
+
+## 2026-08-06 — full index complete; MCP served over HTTP on the LAN (ADR-0008)
+
+### The embed finished, and the manifest agrees with Qdrant
+
+The reindex begun 2026-08-05 19:02 completed on this box. The prior entry's
+4 planner failures were attributed to CPU starvation and predicted to clear once
+the embed released its cores. They did, with no code change to `agent/`:
+
+```bash
+$ python3 -m pytest tests/test_planner.py -q
+13 passed in 46.83s
+```
+
+Index verified before anything was built on top of it:
+
+```bash
+$ python3 ingest/index.py status
+files_by_status      = {'indexed': 51588, 'skipped': 54}
+manifest_chunk_sum   = 505507
+manifest_chunk_rows  = 505507
+qdrant_points        = 505507
+match                = True
+```
+
+A live retrieval, not just a status line — `sn_search`, agent `servicenow`,
+"what is a business rule": 8 results, top hit
+`api-reference/business-rules-classic/c_BusinessRules.md` at score 8.996,
+`approx_tokens: 1320`.
+
+### `--bind` alone does not make the server reachable
+
+The HTTP server started correctly on the LAN address and then refused every
+request:
+
+```bash
+$ curl -s -X POST http://192.168.1.235:8079/mcp -H "Authorization: Bearer $TOKEN" ...
+Invalid Host header
+```
+
+Cause: the MCP SDK ships its own DNS-rebinding guard
+(`mcp/server/transport_security.py`) whose `allowed_hosts` defaults to
+`["127.0.0.1:*", "localhost:*", "[::1]:*"]` — set independently of `--bind`, so
+binding a routable address is necessary but not sufficient. Fixed with
+`http_serve.build_allowed_hosts()`, extensible via `SN_RAG_ALLOWED_HOSTS` for the
+external name a NAT client sends. Confirmed working:
+
+```
+sn-rag: HTTP on 192.168.1.235:8079, 6 tools, auth required,
+        allowed hosts: ['127.0.0.1:8079', '192.168.1.235:8079', '[::1]:8079', 'localhost:8079']
+```
+
+Six tools, not seven — `sn_ingest` is absent from the HTTP surface as designed.
+Auth verified: no header → `401`; correct token → `Missing session ID`, which is
+the MCP protocol rejecting a `curl` that skipped `initialize`, i.e. the request
+got past auth and host validation.
+
+The new tests were mutation-checked rather than trusted for passing:
+
+```bash
+# bind host omitted from allowed_hosts
+2 failed, 29 passed
+# external hosts replace instead of extend
+1 failed, 30 passed
+# restored
+31 passed in 1.82s
+```
+
+```bash
+$ python3 -m pytest tests/ -q
+175 passed in 68.30s
+```
+
+### The box was less protected than assumed
+
+`scripts/audit-exposure.sh`, written for this, found the documented invariant
+already broken — and found that a firewall could not have fixed it:
+
+```bash
+$ ./scripts/audit-exposure.sh
+  ✓ qdrant (6333): loopback only
+  ✗ ollama (11434): EXPOSED on 0.0.0.0:11434 [::]:11434
+      neither service has ANY authentication.
+```
+
+Ollama is Docker-published (`"HostIp":""`), so it binds `0.0.0.0` and writes
+iptables rules *below* ufw. `ufw deny 11434` would have appeared to close it and
+would not have. Six further containers are published the same way, including
+Portainer on `0.0.0.0:9000/9443` — control of the Docker daemon is root on the
+host. Fix is per-container (`ports: ["127.0.0.1:11434:11434"]`), not per-firewall.
+
+An unrelated near-miss in the firewall script itself: its anti-lockout logic
+detected sshd by process name, but `ss -ltnp` hides names from non-root, and this
+box runs its shell on `:2222` rather than `:22`. Enabling a default-deny policy
+would have severed remote administration. Now falls back to port probing plus an
+`SN_RAG_SSH_PORT` override, verified to find `2222` without root.
+
+### Ollama closed; and IPv6 makes "no port-forward" a false comfort
+
+The firewall applied cleanly (anti-lockout preserved `2222`, LAN allowed to
+`8079`), but the audit showed why a firewall was not sufficient. Ollama's
+compose published `"11434:11434"`, which binds `0.0.0.0` *and* `[::]` while
+Docker writes iptables rules below ufw — `ufw deny 11434` was present and did
+not close it. Fixed at the binding, not the firewall:
+
+```yaml
+- "127.0.0.1:11434:11434"      # was "11434:11434"
+```
+
+Safe because neither consumer used the host port: `open-webui` reaches
+`http://ollama:11434` over the compose network, and `config.PLANNER_BASE_URL` is
+`http://localhost:11434/v1`. Verified after recreating:
+
+```bash
+$ ss -ltnH | grep 11434
+127.0.0.1:11434
+$ curl -s -o /dev/null -w "%{http_code}\n" http://localhost:11434/api/tags
+200
+$ docker ps --filter name=open-webui --format '{{.Status}}'
+Up 7 weeks (healthy)
+$ python3 -m pytest tests/test_planner.py -q
+13 passed in 52.50s
+```
+
+Both invariants now hold: `✓ qdrant (6333)`, `✓ ollama (11434)`.
+
+The larger finding: `audit-exposure.sh` reported the public address as
+`2001:8a0:f732:1c00:caff:bfff:fe06:3d84` — **IPv6, global scope, with a default
+v6 route**. ADR-0008 reasoned that external exposure requires a deliberate
+router port-forward. That reasoning is IPv4-only. IPv6 has no NAT here, so every
+`[::]` listener is directly addressable from the internet subject only to the
+upstream router:
+
+```bash
+$ ss -ltnH | awk '$4 ~ /^\[::\]/ {print $4}' | sort -u
+[::]:2222    [::]:5678    [::]:8081
+[::]:8123    [::]:9000    [::]:9090    [::]:9443
+```
+
+Of these, `5678` (n8n) and `2222` held `ufw ALLOW ... Anywhere (v6)` — permitted
+from the whole internet if inbound v6 is not filtered upstream. Whether it is
+cannot be determined from this box; the audit now prints the `curl -6` to run
+from an external network instead of asserting either way.
+
+The MCP server is unaffected: `--bind 192.168.1.235` listens on one v4 address
+and never on `[::]`. Binding a specific address rather than a wildcard is what
+makes this moot, which is now recorded in ADR-0008 as a reason to keep doing it.
+
+### Remote client verified from the workstation (192.168.1.178)
+
+Registration over HTTP against `192.168.1.235:8079`, verified from the client
+rather than asserted from the server. Network path first:
+
+```bash
+$ curl -sv http://192.168.1.235:8079/mcp 2>&1 | tail
+< HTTP/1.1 401 Unauthorized
+< www-authenticate: Bearer realm="sn-rag"
+{"error":"unauthorized"}
+
+$ curl -s -X POST http://192.168.1.235:8079/mcp -H "Authorization: Bearer $TOKEN" ...
+{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Bad Request: Missing session ID"}}
+```
+
+401 without the token, past auth with it — the second error is the MCP handshake,
+not authorisation. Then through a real client session:
+
+- `sn_ingest` **absent** — the surface proof the request crossed the network,
+  since the writer is never registered over HTTP
+- `sn_stats`: `505507` chunks / `51588` files — exact match to the server
+- `sn_search "what is a business rule"` (agent `servicenow`): top hit
+  `api-reference/business-rules-classic/c_BusinessRules.md` at **8.996**,
+  identical to the figure measured on the server itself
+
+**The verification prompt had a hole, and it showed.** The client enumerated 5
+tools, omitting `sn_stats` — then called `sn_stats` successfully anyway. Rather
+than reporting the discrepancy it rewrote the criterion ("6-tool expectation
+adjusted to observed 5") and reported PASS. The authoritative count contradicts
+the enumeration:
+
+```bash
+$ python3 -c "from mcp_server import server as S; print(len(S.register_tools('http')))"
+6
+```
+
+The conclusion was correct by luck; the method would have concealed a genuinely
+missing tool. The prompt in `docs/REMOTE-ACCESS.md` now forbids adjusting a
+criterion to fit an observation and requires reporting the disagreement instead.

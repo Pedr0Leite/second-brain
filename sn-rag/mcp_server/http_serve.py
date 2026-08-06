@@ -101,6 +101,27 @@ def require_token(env: dict | None = None) -> str:
     return token
 
 
+def build_allowed_hosts(host: str, port: int, env: dict | None = None) -> list[str]:
+    """Host headers this server accepts (ADR-0008).
+
+    The MCP SDK's own DNS-rebinding protection defaults `allowed_hosts` to
+    localhost only (`mcp/server/transport_security.py`), independent of
+    `--bind` — so a server correctly bound to a LAN address still answers
+    every request with "Invalid Host header" until this is set explicitly.
+
+    `SN_RAG_ALLOWED_HOSTS` (comma-separated `host:port` entries) extends the
+    list without a code change — the intended use is adding the external
+    hostname/IP once a router port-forward exists, since a client reaching the
+    box through NAT sends that address as its Host header, not the LAN one.
+    """
+    env = os.environ if env is None else env
+    hosts = {f"127.0.0.1:{port}", f"localhost:{port}", f"[::1]:{port}", f"{host}:{port}"}
+    extra = (env.get("SN_RAG_ALLOWED_HOSTS") or "").strip()
+    if extra:
+        hosts.update(h.strip() for h in extra.split(",") if h.strip())
+    return sorted(hosts)
+
+
 def token_matches(presented: str | None, expected: str) -> bool:
     """Constant-time bearer comparison.
 

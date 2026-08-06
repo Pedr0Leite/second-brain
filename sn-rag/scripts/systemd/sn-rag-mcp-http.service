@@ -1,0 +1,21 @@
+[Unit]
+Description=sn-rag MCP server, authenticated HTTP transport (ADR-0006, ADR-0008)
+After=network-online.target qdrant.service
+Wants=network-online.target
+Requires=qdrant.service
+
+[Service]
+Type=exec
+EnvironmentFile=%h/.config/sn-rag/http.env
+Environment=SN_RAG_DIR=%h/sn-rag
+Environment=PYTHONPATH=%h/sn-rag
+WorkingDirectory=%h/sn-rag
+ExecStart=%h/sn-rag/scripts/mcp-http-start.sh
+
+# Same rationale as qdrant.service: an unsupervised server that dies leaves
+# every remote client silently unable to reach the corpus.
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=default.target

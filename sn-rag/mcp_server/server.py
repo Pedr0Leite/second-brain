@@ -330,11 +330,16 @@ def main(argv: list[str]) -> int:
     import uvicorn
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-    app = server.streamable_http_app()
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    allowed_hosts = http_serve.build_allowed_hosts(cfg.host, cfg.port)
+    app = server.streamable_http_app(
+        transport_security=TransportSecuritySettings(allowed_hosts=allowed_hosts)
+    )
     app.add_middleware(http_serve.build_auth_middleware(token))
 
-    print(f"sn-rag: HTTP on {cfg.host}:{cfg.port}, {len(names)} tools, auth required",
-          file=sys.stderr)
+    print(f"sn-rag: HTTP on {cfg.host}:{cfg.port}, {len(names)} tools, auth required, "
+          f"allowed hosts: {allowed_hosts}", file=sys.stderr)
     uvicorn.run(app, host=cfg.host, port=cfg.port, log_level="info")
     return 0
 

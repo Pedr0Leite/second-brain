@@ -80,6 +80,49 @@ def test_correct_token_accepted_case_insensitive_scheme():
     assert H.token_matches(f"bearer {tok}", tok) is True
 
 
+# --- allowed hosts (ADR-0008) ---------------------------------------------
+#
+# The SDK's DNS-rebinding guard defaults to localhost only, independent of
+# --bind, so a server correctly bound to a LAN address answers every request
+# with "Invalid Host header" until this list includes it. That failure looks
+# like a broken server rather than a config gap, which is why it is asserted.
+
+def test_bind_address_is_always_allowed():
+    hosts = H.build_allowed_hosts("192.168.1.235", 8079, env={})
+    assert "192.168.1.235:8079" in hosts
+
+
+def test_loopback_stays_allowed_alongside_a_lan_bind():
+    """A LAN bind must not break local tooling that calls 127.0.0.1."""
+    hosts = H.build_allowed_hosts("192.168.1.235", 8079, env={})
+    assert {"127.0.0.1:8079", "localhost:8079", "[::1]:8079"} <= set(hosts)
+
+
+def test_port_is_carried_into_every_entry():
+    for entry in H.build_allowed_hosts("10.0.0.5", 41879, env={}):
+        assert entry.endswith(":41879"), entry
+
+
+def test_external_hosts_extend_rather_than_replace():
+    """A NAT client sends the external name, but the LAN one must keep working."""
+    hosts = H.build_allowed_hosts(
+        "192.168.1.235", 8079,
+        env={"SN_RAG_ALLOWED_HOSTS": "vault.example.org:41879, 203.0.113.9:41879"},
+    )
+    assert "vault.example.org:41879" in hosts
+    assert "203.0.113.9:41879" in hosts
+    assert "192.168.1.235:8079" in hosts
+
+
+def test_blank_and_whitespace_entries_are_dropped():
+    """An empty Host never matches, so an empty entry is silent dead weight."""
+    hosts = H.build_allowed_hosts(
+        "10.0.0.5", 8079, env={"SN_RAG_ALLOWED_HOSTS": " , ,, "},
+    )
+    assert all(h.strip() for h in hosts)
+    assert "" not in hosts
+
+
 # --- tool surface ---------------------------------------------------------
 
 def test_http_surface_excludes_the_writer_and_stdio_includes_it():

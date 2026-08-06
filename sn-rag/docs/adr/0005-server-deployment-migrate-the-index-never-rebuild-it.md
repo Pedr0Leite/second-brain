@@ -1,8 +1,44 @@
 # ADR-0005: Deploying to a home server — migrate the index, never rebuild it
 
 **Date:** 2026-08-05
-**Status:** Proposed — no hardware selected, nothing implemented
+**Status:** Superseded by events 2026-08-06 — see "What actually happened"
+below. The migrate-never-rebuild *principle* still holds; the specific plan of
+copying a Qdrant snapshot from the workstation did not happen because the
+target box did its own embed instead.
 **Phase:** 7 (operations)
+
+## What actually happened (2026-08-06)
+
+Hardware got selected and deployed before this ADR's plan was executed: the
+target machine is `milkserver` — AMD Ryzen 7 7730U, 16 threads, 14 GB RAM, no
+GPU (`nvidia-smi` absent) — reachable on the LAN at `192.168.1.235`. This is a
+different box than either the original workstation (Ryzen 5 9600X, 25 GB) or
+the N100-class NiPoGi this ADR's throughput estimates were built around.
+
+**The embed ran in place on this box, not migrated in.** `python3
+ingest/index.py embed --recreate` ran directly on `milkserver`, taking roughly
+16 hours (started 2026-08-05 19:02, still running the next morning). This
+directly contradicts the "bulk embedding stays on the workstation" decision
+below — there was no separate workstation available to embed on ahead of time,
+so the choice was between waiting one long embed on the deploy box or not
+deploying. Verified on completion:
+
+```
+$ python3 ingest/index.py status
+files_by_status      = {'indexed': 51588, 'skipped': 54}
+manifest_chunk_sum   = 505507
+manifest_chunk_rows  = 505507
+qdrant_points        = 505507
+match                = True
+```
+
+This does not invalidate the ADR's core argument — a *second* box added later
+should still receive a copied snapshot rather than re-embedding, since the
+16-hour cost is exactly what the "migrate, never rebuild" principle exists to
+avoid paying twice. It only means the first deployment target paid that cost
+once, out of necessity rather than by the ADR's original design. See
+`docs/NIPOGI-BOOTSTRAP-PROMPT.md` and ADR-0008 for what is built on top of this
+box now that it holds the live index.
 
 ## Context
 
