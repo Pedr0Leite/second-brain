@@ -475,6 +475,12 @@ With the token added, the same request returns `Missing session ID` — that is
 **success**: it passed auth and failed later, at the MCP handshake, because
 `curl` is not an MCP client.
 
+Watch it from the other side while you test: `journalctl --user -u
+sn-rag-mcp-http.service -f` **on the server** shows each attempt with the
+client's address and status, so you can tell "the request never arrived" from
+"it arrived and was rejected". See
+[Watching MCP traffic](#watching-mcp-traffic).
+
 > **A firewall does not cover Docker.** Containers published as `-p 8080:8080`
 > bind `0.0.0.0` and write iptables rules *below* ufw, so `ufw deny 8080` does
 > not close them. Restrict them per-container instead —
@@ -741,16 +747,20 @@ setsid nohup python3 ingest/index.py embed --shuffle \
 
 ### Services
 
+All of these run **on the server** — the machine holding the index.
+
 | command | does |
 |---|---|
 | `systemctl --user is-active qdrant.service` | is the vector store up |
 | `systemctl --user restart qdrant.service` | restart it |
+| `systemctl --user status sn-rag-mcp-http.service` | is the HTTP MCP server serving, and on what address |
+| `systemctl --user restart sn-rag-mcp-http.service` | restart it — needed after changing the token or `SN_RAG_ALLOWED_HOSTS` |
 | `systemctl --user list-timers sn-rag-sync.timer` | when the nightly sync next fires |
 | `systemctl --user start sn-rag-sync.service` | run the sync now |
 | `journalctl --user -u sn-rag-sync.service -n 50` | sync logs |
 | `curl -s localhost:6333/collections/knowledge` | raw collection stats |
 | `curl -s localhost:11434/api/tags` | is the planner model loaded |
-| `sudo loginctl enable-linger "$USER"` | **headless servers only** — without it user timers never fire |
+| `sudo loginctl enable-linger "$USER"` | **headless servers only** — without it user units die at logout |
 
 ### Inspecting state
 
@@ -758,7 +768,51 @@ setsid nohup python3 ingest/index.py embed --shuffle \
 python3 -c "import config; print(config.CORPUS_PATH, config.MANIFEST_DB_PATH)"
 tail -f ~/.local/state/sn-rag/full-embed.log
 pgrep -af 'index.py embed'                       # is an index job running
+./scripts/audit-exposure.sh                      # what is reachable off-box
 ```
+
+### Watching MCP traffic
+
+Who is querying the server, when, and whether it worked. Run **on the server**;
+the HTTP transport logs every request through systemd.
+
+```bash
+# live tail
+journalctl --user -u sn-rag-mcp-http.service -f
+
+# MCP requests only, without the downstream Qdrant chatter
+journalctl --user -u sn-rag-mcp-http.service -f | grep 'POST /mcp'
+
+# which clients connected today, and how often
+journalctl --user -u sn-rag-mcp-http.service --since today \
+  | grep -oP '\d+\.\d+\.\d+\.\d+(?=:\d+ - "POST)' | sort | uniq -c
+
+# rejected attempts — the line worth alerting on
+journalctl --user -u sn-rag-mcp-http.service --since today | grep -i '401\|unauthenticated'
+```
+
+Each request logs **timestamp, client address, method, path and status**:
+
+```
+INFO: 192.168.1.178:44818 - "POST /mcp HTTP/1.1" 200 OK
+```
+
+followed by the Qdrant query it triggered — useful for confirming a search
+actually reached the index rather than returning empty from a healthy-looking
+server.
+
+**What is deliberately absent, and why**
+
+| not logged | reason |
+|---|---|
+| which tool was called | every MCP call is a `POST /mcp` under streamable HTTP, so `sn_search` and `sn_outline` are indistinguishable in the access log |
+| query text or arguments | request bodies contain what you searched for. Logging them writes the content of your questions into the system journal |
+| the presented bearer token | a credential in the journal outlives its rotation. `http_serve.py` logs the peer address and path on a 401, never the token |
+
+Per-tool visibility is therefore an **ADR-sized decision, not a config flag** — it
+changes what the machine records about its operator. The honest options are a
+counter (tool name and timestamp, no arguments) or full request logging with the
+privacy cost stated outright.
 
 ---
 
